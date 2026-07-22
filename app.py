@@ -15,11 +15,12 @@ import streamlit as st
 from ai_agent import ask_agent
 from finance_engine import (
     apply_carry_waterfall,
+    build_unfunded_schedule,
     forecast_cashflows,
     forecast_from_portfolio,
     fund_metrics_to_date,
+    reported_vs_market_value,
     secondary_pricing,
-    unfunded_commitment_calls,
 )
 
 st.set_page_config(page_title="Secondary Modelling Agent", layout="wide")
@@ -55,14 +56,14 @@ forecast_mode = st.sidebar.radio(
     "Forecast mode",
     ["Aggregate NAV (simple)", "Portfolio companies (detailed)"],
     index=0,
-    help="Portfolio mode lets each holding have its own growth rate and exit year instead of "
-         "one shared NAV growing on a single runoff curve.",
+    help="Portfolio mode lets each holding have its own growth rate, valuation "
+         "adjustment, and exit timing instead of one shared NAV on a single runoff curve.",
 )
 as_of = st.sidebar.date_input("As-of date", value=date.today())
 
 if forecast_mode == "Aggregate NAV (simple)":
     nav_current = st.sidebar.number_input(
-        "Current NAV ($)", min_value=0.0, value=62_000_000.0, step=1_000_000.0, format="%.0f"
+        "Current NAV / Reported Value ($)", min_value=0.0, value=62_000_000.0, step=1_000_000.0, format="%.0f"
     )
 else:
     nav_current = None  # computed below from the portfolio companies table
@@ -96,45 +97,66 @@ if forecast_mode == "Aggregate NAV (simple)":
 else:
     gross_return = None
     shape = None
-    st.sidebar.write("Portfolio companies (value, expected annual return, exit year):")
+    st.sidebar.write(
+        "Portfolio companies - Reported Value is the GP's official mark; MV Adjustment "
+        "lets you apply your own diligence-based view on top of it."
+    )
     default_portfolio = pd.DataFrame([
-        {"Company": "Company A", "Value ($M)": 15.0, "Return (%)": 25.0, "Exit Year": 3},
-        {"Company": "Company B", "Value ($M)": 12.0, "Return (%)": 18.0, "Exit Year": 5},
-        {"Company": "Company C", "Value ($M)": 10.0, "Return (%)": 10.0, "Exit Year": 2},
-        {"Company": "Company D", "Value ($M)": 15.0, "Return (%)": 20.0, "Exit Year": 4},
-        {"Company": "Company E", "Value ($M)": 10.0, "Return (%)": 12.0, "Exit Year": 5},
+        {"Company": "Company A", "Reported Value ($M)": 15.0, "MV Adjustment (%)": 0.0,
+         "Expected Return (%)": 25.0, "Exit Year 1": 3, "Exit % 1": 100.0, "Exit Year 2": 3, "Exit % 2": 0.0},
+        {"Company": "Company B", "Reported Value ($M)": 12.0, "MV Adjustment (%)": -10.0,
+         "Expected Return (%)": 18.0, "Exit Year 1": 3, "Exit % 1": 50.0, "Exit Year 2": 5, "Exit % 2": 100.0},
+        {"Company": "Company C", "Reported Value ($M)": 10.0, "MV Adjustment (%)": 5.0,
+         "Expected Return (%)": 10.0, "Exit Year 1": 2, "Exit % 1": 100.0, "Exit Year 2": 2, "Exit % 2": 0.0},
+        {"Company": "Company D", "Reported Value ($M)": 15.0, "MV Adjustment (%)": 0.0,
+         "Expected Return (%)": 20.0, "Exit Year 1": 4, "Exit % 1": 100.0, "Exit Year 2": 4, "Exit % 2": 0.0},
+        {"Company": "Company E", "Reported Value ($M)": 10.0, "MV Adjustment (%)": -5.0,
+         "Expected Return (%)": 12.0, "Exit Year 1": 5, "Exit % 1": 100.0, "Exit Year 2": 5, "Exit % 2": 0.0},
     ])
     portfolio_df = st.sidebar.data_editor(
         default_portfolio, num_rows="dynamic", width="stretch", key="portfolio_editor"
     )
     if len(portfolio_df) > 0:
-        nav_current = float(portfolio_df["Value ($M)"].sum()) * 1_000_000
-        remaining_years = int(portfolio_df["Exit Year"].max())
+        nav_current = float(portfolio_df["Reported Value ($M)"].sum()) * 1_000_000
+        remaining_years = int(max(portfolio_df["Exit Year 1"].max(), portfolio_df["Exit Year 2"].max()))
     else:
         nav_current = 0.0
         remaining_years = 1
-    st.sidebar.caption(f"Aggregate current NAV from portfolio: ${nav_current:,.0f}")
+    st.sidebar.caption(f"Aggregate Reported NAV from portfolio: ${nav_current:,.0f}")
 
 st.sidebar.header("4. Unfunded commitment")
-unfunded_commitment = st.sidebar.number_input(
-    "Unfunded commitment the buyer assumes ($)", min_value=0.0, value=0.0, step=500_000.0, format="%.0f"
+st.sidebar.write("Known follow-on investments (already identified):")
+default_followons = pd.DataFrame([
+    {"Name": "Follow-on A", "Amount ($M)": 2.0, "Year": 1},
+])
+known_followons_df = st.sidebar.data_editor(
+    default_followons, num_rows="dynamic", width="stretch", key="followons_editor"
 )
-if unfunded_commitment > 0:
-    call_years = st.sidebar.slider(
-        "Capital call period (years)", 1, remaining_years, min(2, remaining_years)
-    )
-    st.sidebar.caption(
-        "Spread evenly over this many years starting immediately - capital calls in PE funds "
-        "typically taper off well before the fund's final years."
+blind_pool_amount = st.sidebar.number_input(
+    "Blind pool (unidentified future calls, $)", min_value=0.0, value=0.0, step=500_000.0, format="%.0f"
+)
+if blind_pool_amount > 0:
+    blind_pool_years = st.sidebar.slider(
+        "Blind pool call period (years)", 1, max(1, remaining_years), min(2, max(1, remaining_years))
     )
 else:
-    call_years = 0
+    blind_pool_years = 0
+st.sidebar.caption(
+    "Known follow-ons are called in full in their specified year. The blind pool is spread "
+    "evenly over its call period, front-loaded like a typical PE investment period."
+)
 
 st.sidebar.header("5. Fees & carried interest")
 apply_fees = st.sidebar.checkbox("Apply management fee & carry", value=True)
 mgmt_fee = st.sidebar.slider("Annual management fee (%)", 0.0, 5.0, 2.0, step=0.25) / 100
 hurdle_rate = st.sidebar.slider("Preferred return / hurdle (%)", 0.0, 15.0, 8.0, step=0.5) / 100
 carry_rate = st.sidebar.slider("Carried interest (%)", 0.0, 30.0, 20.0, step=1.0) / 100
+accrued_carry = st.sidebar.number_input(
+    "Accrued carried interest to date ($)", min_value=0.0, value=0.0, step=250_000.0, format="%.0f",
+    help="Carry already crystallized/owed to the GP as of the as-of date - a liability that "
+         "reduces the net value actually available to the LP, separate from carry the "
+         "waterfall above computes on future distributions."
+)
 
 st.sidebar.header("6. AI Agent")
 api_key = st.sidebar.text_input("Anthropic API key (optional)", type="password")
@@ -150,19 +172,30 @@ if forecast_mode == "Aggregate NAV (simple)":
         nav_current, remaining_years, gross_return, shape, as_of,
         mgmt_fee_rate=mgmt_fee if apply_fees else 0.0,
     )
+    portfolio_display = None
 else:
-    companies = [
-        {
+    companies = []
+    portfolio_display_rows = []
+    for _, row in portfolio_df.iterrows():
+        rv = float(row["Reported Value ($M)"]) * 1_000_000
+        adj = float(row["MV Adjustment (%)"]) / 100
+        mv = reported_vs_market_value(rv, adj)
+        companies.append({
             "name": row["Company"],
-            "current_value": float(row["Value ($M)"]) * 1_000_000,
-            "expected_return": float(row["Return (%)"]) / 100,
-            "exit_year": int(row["Exit Year"]),
-        }
-        for _, row in portfolio_df.iterrows()
-    ]
+            "current_value": mv,
+            "expected_return": float(row["Expected Return (%)"]) / 100,
+            "exit_year_1": int(row["Exit Year 1"]),
+            "exit_pct_1": float(row["Exit % 1"]) / 100,
+            "exit_year_2": int(row["Exit Year 2"]),
+            "exit_pct_2": float(row["Exit % 2"]) / 100,
+        })
+        portfolio_display_rows.append({
+            "Company": row["Company"], "Reported Value": rv, "MV Adjustment": adj, "Market Value": mv,
+        })
     forecast_rows = forecast_from_portfolio(
         companies, mgmt_fee_rate=mgmt_fee if apply_fees else 0.0, as_of=as_of
     )
+    portfolio_display = pd.DataFrame(portfolio_display_rows)
 
 if apply_fees:
     forecast_rows = apply_carry_waterfall(
@@ -172,18 +205,27 @@ if apply_fees:
 else:
     distribution_key = "gross_distribution"
 
-unfunded_calls = unfunded_commitment_calls(
-    unfunded_commitment, forecast_rows, call_years if unfunded_commitment > 0 else None
-)
+known_followons = [
+    {"name": r["Name"], "amount": float(r["Amount ($M)"]) * 1_000_000, "year": int(r["Year"])}
+    for _, r in known_followons_df.iterrows()
+] if len(known_followons_df) > 0 else []
+unfunded_calls = build_unfunded_schedule(known_followons, blind_pool_amount, blind_pool_years, forecast_rows)
+total_unfunded = sum(unfunded_calls.values())
+
+net_nav = max(0.0, nav_current - accrued_carry)
 
 discount_levels = [-0.10, 0.0, 0.10, 0.20, 0.30, 0.40]
-pricing = secondary_pricing(nav_current, forecast_rows, as_of, discount_levels, distribution_key, unfunded_calls)
+pricing = secondary_pricing(net_nav, forecast_rows, as_of, discount_levels, distribution_key, unfunded_calls)
+
+buyer_target_discount = 0.15  # used for the Buyer-vs-Seller headline comparison in tab 3
 
 metrics_context = {
     "to_date": {
         "paid_in": to_date.paid_in,
         "distributions": to_date.distributions,
-        "nav": to_date.nav,
+        "nav_reported": to_date.nav,
+        "accrued_carry_to_date": accrued_carry,
+        "net_nav_after_accrued_carry": net_nav,
         "dpi": to_date.dpi,
         "rvpi": to_date.rvpi,
         "tvpi": to_date.tvpi,
@@ -201,8 +243,11 @@ metrics_context = {
         "mgmt_fee": mgmt_fee,
         "hurdle_rate": hurdle_rate,
         "carry_rate": carry_rate,
-        "unfunded_commitment": unfunded_commitment,
-        "call_years": call_years,
+        "accrued_carry_to_date": accrued_carry,
+        "known_followons": known_followons,
+        "blind_pool_amount": blind_pool_amount,
+        "blind_pool_years": blind_pool_years,
+        "total_unfunded": total_unfunded,
     },
 }
 
@@ -217,13 +262,20 @@ with tab1:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Paid-in Capital", f"${to_date.paid_in:,.0f}")
     c2.metric("Distributions to date", f"${to_date.distributions:,.0f}")
-    c3.metric("Current NAV", f"${to_date.nav:,.0f}")
+    c3.metric("Reported NAV", f"${to_date.nav:,.0f}")
     c4.metric("TVPI", f"{to_date.tvpi:.2f}x")
 
-    c5, c6 = st.columns(2)
+    c5, c6, c7 = st.columns(3)
     irr_txt = f"{to_date.irr*100:.1f}%" if to_date.irr == to_date.irr else "n/a"
     c5.metric("IRR to date", irr_txt)
     c6.metric("DPI / RVPI", f"{to_date.dpi:.2f}x / {to_date.rvpi:.2f}x")
+    c7.metric("Net NAV (after accrued carry)", f"${net_nav:,.0f}")
+    if accrued_carry > 0:
+        st.caption(
+            f"${accrued_carry:,.0f} of carry has already crystallized/is owed to the GP as of "
+            f"the as-of date, so only ${net_nav:,.0f} of the ${to_date.nav:,.0f} reported NAV "
+            f"is economically available to the LP."
+        )
 
     fig = go.Figure()
     fig.add_bar(x=[d.isoformat() for d in cf_dates], y=[-c for c in calls], name="Capital Calls")
@@ -232,6 +284,15 @@ with tab1:
     st.plotly_chart(fig, width="stretch")
 
 with tab2:
+    if portfolio_display is not None:
+        st.write("Reported Value vs. buyer-adjusted Market Value per company:")
+        st.dataframe(
+            portfolio_display.style.format({
+                "Reported Value": "${:,.0f}", "Market Value": "${:,.0f}", "MV Adjustment": "{:+.0%}",
+            }),
+            width="stretch",
+        )
+
     fdf = pd.DataFrame(forecast_rows)
 
     st.caption(
@@ -240,8 +301,9 @@ with tab2:
     )
     if forecast_mode != "Aggregate NAV (simple)":
         st.caption(
-            "Portfolio mode: each company compounds at its own expected return and pays out in full "
-            "in its own exit year, instead of following one shared runoff curve."
+            "Portfolio mode: each company compounds at its own expected return off its Market "
+            "Value, and pays out per its own exit schedule (which may be phased across two years) "
+            "instead of following one shared runoff curve."
         )
         exit_rows = []
         for r in forecast_rows:
@@ -249,9 +311,11 @@ with tab2:
                 exit_rows.append({"Year": r["year"], "Date": r["date"], "Company": e["name"], "Exit Value": e["value"]})
         if exit_rows:
             exit_df = pd.DataFrame(exit_rows)
-            st.dataframe(
-                exit_df.style.format({"Exit Value": "${:,.0f}"}), width="stretch"
-            )
+            st.dataframe(exit_df.style.format({"Exit Value": "${:,.0f}"}), width="stretch")
+
+    if total_unfunded > 0:
+        st.caption(f"Buyer's unfunded call schedule (${total_unfunded:,.0f} total): {unfunded_calls}")
+
     if apply_fees:
         st.caption(
             f"Net of a {mgmt_fee*100:.1f}% annual management fee and {carry_rate*100:.0f}% "
@@ -299,12 +363,34 @@ with tab2:
     st.plotly_chart(fig2, width="stretch")
 
 with tab3:
-    if unfunded_commitment > 0:
+    st.subheader("Buyer vs. Seller")
+    seller_row = secondary_pricing(net_nav, forecast_rows, as_of, [0.0], distribution_key, unfunded_calls)[0]
+    buyer_row = secondary_pricing(net_nav, forecast_rows, as_of, [buyer_target_discount], distribution_key, unfunded_calls)[0]
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        st.markdown("**Seller (holds at par to net NAV, 0% discount)**")
+        st.metric("Reference price", f"${seller_row['price']:,.0f}")
+        st.metric("Implied IRR", f"{seller_row['irr']*100:.1f}%" if seller_row['irr'] == seller_row['irr'] else "n/a")
+        st.metric("Implied MOIC", f"{seller_row['moic']:.2f}x")
+    with bc2:
+        st.markdown(f"**Buyer (at a {buyer_target_discount*100:.0f}% discount to net NAV)**")
+        st.metric("Purchase price", f"${buyer_row['price']:,.0f}")
+        st.metric("Projected IRR", f"{buyer_row['irr']*100:.1f}%" if buyer_row['irr'] == buyer_row['irr'] else "n/a")
+        st.metric("Projected MOIC", f"{buyer_row['moic']:.2f}x")
+    st.caption(
+        "Both sides project off the same underlying distributions; the Seller's figures are the "
+        "'hold' case at the fund's net NAV, and the Buyer's figures show the extra return created "
+        "purely by the negotiated discount."
+    )
+
+    st.subheader("Full pricing sensitivity")
+    if total_unfunded > 0:
         st.caption(
-            f"Buyer also funds ${unfunded_commitment:,.0f} of unfunded commitment over "
-            f"{call_years} year(s) - included in 'Total invested' and netted against distributions "
-            f"in the IRR/MOIC below."
+            f"Buyer also funds ${total_unfunded:,.0f} of unfunded commitment (known follow-ons + "
+            f"blind pool) - included in 'Total invested' and netted against distributions below."
         )
+    if accrued_carry > 0:
+        st.caption(f"Priced off net NAV of ${net_nav:,.0f} (reported NAV less ${accrued_carry:,.0f} accrued carry).")
     pdf_ = pd.DataFrame(pricing)
     pdf_display = pdf_.copy()
     pdf_display["discount"] = pdf_display["discount"].map(lambda x: f"{x*100:.0f}%")
@@ -313,7 +399,7 @@ with tab3:
     pdf_display["total_invested"] = pdf_display["total_invested"].map(lambda x: f"${x:,.0f}")
     pdf_display["irr"] = pdf_display["irr"].map(lambda x: f"{x*100:.1f}%" if x == x else "n/a")
     pdf_display["moic"] = pdf_display["moic"].map(lambda x: f"{x:.2f}x")
-    display_cols = ["discount", "price", "unfunded_calls", "total_invested", "irr", "moic"] if unfunded_commitment > 0 else ["discount", "price", "irr", "moic"]
+    display_cols = ["discount", "price", "unfunded_calls", "total_invested", "irr", "moic"] if total_unfunded > 0 else ["discount", "price", "irr", "moic"]
     st.dataframe(pdf_display[display_cols], width="stretch")
 
     fig3 = go.Figure()
@@ -324,8 +410,8 @@ with tab3:
         name="Buyer IRR",
     )
     fig3.update_layout(
-        title="Buyer IRR vs. Discount to NAV",
-        xaxis_title="Discount to NAV (%)",
+        title="Buyer IRR vs. Discount to Net NAV",
+        xaxis_title="Discount to Net NAV (%)",
         yaxis_title="Projected IRR (%)",
     )
     st.plotly_chart(fig3, width="stretch")

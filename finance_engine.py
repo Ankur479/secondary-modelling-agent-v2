@@ -146,30 +146,40 @@ def forecast_cashflows(nav_current: float, remaining_years: int, gross_return: f
 
 def forecast_from_portfolio(companies: List[Dict], mgmt_fee_rate: float, as_of: date) -> List[Dict]:
     """
-    companies: list of {"name": str, "current_value": float, "expected_return": float,
-    "exit_year": int}. Each company compounds at its own expected_return until its own
-    exit_year, at which point its full grown value is distributed as a lump sum (an
-    exit/sale), rather than every holding following one shared runoff curve.
+    companies: list of dicts with keys:
+      name, current_value (the value the forecast compounds from - typically a buyer's
+      diligence-adjusted Market Value, see reported_vs_market_value below),
+      expected_return, exit_year_1, exit_pct_1, exit_year_2, exit_pct_2.
 
-    Management fee is still charged fund-level each year, on the aggregate value of
-    companies not yet exited, and deducted proportionally from each held company's
-    value (so it nets out of both what's distributed and what's carried forward).
+    Each company compounds at its own expected_return every year it's still held.
+    exit_pct_1 is the fraction of that year's (post-fee) value distributed in
+    exit_year_1; exit_pct_2 is the fraction of what's left distributed in
+    exit_year_2. Setting exit_year_1 == exit_year_2 with exit_pct_1=0, exit_pct_2=1.0
+    reproduces a single lump-sum exit; setting them apart with both percentages > 0
+    models a phased/partial realization (e.g. a partial secondary sale of the
+    position followed by a later full exit), which is common in real deals where a
+    company's proceeds arrive across more than one year.
+
+    Management fee is charged fund-level each year on the aggregate value of
+    companies not yet fully exited, deducted proportionally from each held
+    company's value.
 
     Returns rows in the same shape as forecast_cashflows (plus an 'exits' list per
     row for transparency), so apply_carry_waterfall/secondary_pricing work unchanged.
     """
     if not companies:
         return []
-    max_year = max(max(1, int(c["exit_year"])) for c in companies)
+    max_year = max(max(int(c.get("exit_year_1", 1)), int(c.get("exit_year_2", 1))) for c in companies)
+    max_year = max(1, max_year)
     values = {i: float(c["current_value"]) for i, c in enumerate(companies)}
-    exited = set()
+    fully_exited = set()
     rows = []
     for t in range(1, max_year + 1):
-        beginning_nav = sum(v for i, v in values.items() if i not in exited)
+        beginning_nav = sum(v for i, v in values.items() if i not in fully_exited)
         grown_vals = {}
         grown_total = 0.0
         for i, c in enumerate(companies):
-            if i in exited:
+            if i in fully_exited:
                 continue
             gv = values[i] * (1 + float(c["expected_return"]))
             grown_vals[i] = gv
@@ -179,17 +189,27 @@ def forecast_from_portfolio(companies: List[Dict], mgmt_fee_rate: float, as_of: 
         distribution = 0.0
         exits_this_year = []
         for i, c in enumerate(companies):
-            if i in exited:
+            if i in fully_exited:
                 continue
             net_val = grown_vals[i] * fee_ratio
-            exit_year_i = max(1, int(c["exit_year"]))
-            if exit_year_i == t:
-                distribution += net_val
-                exited.add(i)
-                exits_this_year.append({"name": c.get("name", f"Company {i + 1}"), "value": net_val})
+            this_company_dist = 0.0
+            if int(c.get("exit_year_1", 0)) == t and float(c.get("exit_pct_1", 0)) > 0:
+                amt = net_val * float(c["exit_pct_1"])
+                this_company_dist += amt
+                net_val -= amt
+            if int(c.get("exit_year_2", 0)) == t and float(c.get("exit_pct_2", 0)) > 0:
+                amt = net_val * float(c["exit_pct_2"])
+                this_company_dist += amt
+                net_val -= amt
+            distribution += this_company_dist
+            if this_company_dist > 0:
+                exits_this_year.append({"name": c.get("name", f"Company {i + 1}"), "value": this_company_dist})
+            if net_val <= 1e-6:
+                fully_exited.add(i)
+                values[i] = 0.0
             else:
                 values[i] = net_val
-        ending_nav = sum(v for i, v in values.items() if i not in exited)
+        ending_nav = sum(v for i, v in values.items() if i not in fully_exited)
         try:
             fdate = as_of.replace(year=as_of.year + t)
         except ValueError:
@@ -205,6 +225,17 @@ def forecast_from_portfolio(companies: List[Dict], mgmt_fee_rate: float, as_of: 
             "exits": exits_this_year,
         })
     return rows
+
+
+def reported_vs_market_value(reported_value: float, mv_adjustment: float) -> float:
+    """
+    Market Value = a buyer's own diligence-adjusted view of a holding's value,
+    expressed as a +/- adjustment to the GP's officially Reported Value.
+    E.g. mv_adjustment = -0.10 means the buyer marks the holding down 10% versus
+    what the GP reports (common when a buyer has more current information on a
+    pending sale process, for example).
+    """
+    return reported_value * (1 + mv_adjustment)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +310,34 @@ def unfunded_commitment_calls(unfunded_amount: float, forecast_rows: List[Dict],
     call_years = max(1, min(call_years, n))
     per_year = unfunded_amount / call_years
     return {r["year"]: (per_year if r["year"] <= call_years else 0.0) for r in forecast_rows}
+
+
+def build_unfunded_schedule(known_followons: List[Dict], blind_pool_amount: float,
+                             blind_pool_call_years: int, forecast_rows: List[Dict]) -> Dict[int, float]:
+    """
+    Splits a buyer's future funding obligation into two pieces, mirroring how real
+    secondary deals separate what's already known from what isn't:
+      - known_followons: specific, already-identified future investments, each
+        {"name": str, "amount": float, "year": int} - called in full in that year.
+      - blind_pool_amount: remaining unfunded commitment with no identified specific
+        use yet, spread evenly over blind_pool_call_years (front-loaded, like
+        unfunded_commitment_calls above).
+    Returns a combined {year: total_call_amount}.
+    """
+    n = len(forecast_rows)
+    schedule = {r["year"]: 0.0 for r in forecast_rows}
+    if n == 0:
+        return schedule
+    for f in known_followons or []:
+        y = max(1, min(int(f["year"]), n))
+        schedule[y] = schedule.get(y, 0.0) + float(f["amount"])
+    if blind_pool_amount and blind_pool_amount > 0:
+        by = blind_pool_call_years if blind_pool_call_years else max(1, n // 2)
+        by = max(1, min(int(by), n))
+        per_year = blind_pool_amount / by
+        for y in range(1, by + 1):
+            schedule[y] = schedule.get(y, 0.0) + per_year
+    return schedule
 
 
 # ---------------------------------------------------------------------------
