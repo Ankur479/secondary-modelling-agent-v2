@@ -19,6 +19,7 @@ from finance_engine import (
     forecast_cashflows,
     forecast_from_portfolio,
     fund_metrics_to_date,
+    leverage_overlay,
     reported_vs_market_value,
     secondary_pricing,
 )
@@ -158,7 +159,21 @@ accrued_carry = st.sidebar.number_input(
          "waterfall above computes on future distributions."
 )
 
-st.sidebar.header("6. AI Agent")
+st.sidebar.header("6. Leverage (optional)")
+use_leverage = st.sidebar.checkbox("Buyer finances part of the purchase with a facility", value=False)
+if use_leverage:
+    leverage_pct = st.sidebar.slider("Leverage (% of purchase price)", 0.0, 90.0, 40.0, step=5.0) / 100
+    leverage_rate = st.sidebar.slider("Facility interest rate (%)", 0.0, 15.0, 6.5, step=0.25) / 100
+    st.sidebar.caption(
+        "A subscription line / NAV facility funds this share of the purchase price at close. "
+        "Available cash each year sweeps to interest then principal until the balance hits "
+        "zero; the facility never funds unfunded capital calls, only the purchase itself."
+    )
+else:
+    leverage_pct = 0.0
+    leverage_rate = 0.0
+
+st.sidebar.header("7. AI Agent")
 api_key = st.sidebar.text_input("Anthropic API key (optional)", type="password")
 st.sidebar.caption("No key? The assistant still answers using a rule-based summary of the numbers.")
 
@@ -218,6 +233,13 @@ discount_levels = [-0.10, 0.0, 0.10, 0.20, 0.30, 0.40]
 pricing = secondary_pricing(net_nav, forecast_rows, as_of, discount_levels, distribution_key, unfunded_calls)
 
 buyer_target_discount = 0.15  # used for the Buyer-vs-Seller headline comparison in tab 3
+buyer_row = secondary_pricing(net_nav, forecast_rows, as_of, [buyer_target_discount], distribution_key, unfunded_calls)[0]
+
+leverage_result = None
+if use_leverage and leverage_pct > 0:
+    leverage_result = leverage_overlay(
+        buyer_row, forecast_rows, as_of, distribution_key, unfunded_calls, leverage_pct, leverage_rate
+    )
 
 metrics_context = {
     "to_date": {
@@ -249,6 +271,18 @@ metrics_context = {
         "blind_pool_years": blind_pool_years,
         "total_unfunded": total_unfunded,
     },
+    "leverage": {
+        "used": use_leverage and leverage_pct > 0,
+        "leverage_pct": leverage_pct,
+        "interest_rate": leverage_rate,
+        "buyer_discount_this_applies_to": buyer_target_discount,
+        "unlevered_irr": buyer_row["irr"],
+        "unlevered_moic": buyer_row["moic"],
+        "levered_irr": leverage_result["levered_irr"] if leverage_result else None,
+        "levered_moic": leverage_result["levered_moic"] if leverage_result else None,
+        "initial_draw": leverage_result["initial_draw"] if leverage_result else None,
+        "equity_invested": leverage_result["equity_invested"] if leverage_result else None,
+    } if use_leverage else None,
 }
 
 # --------------------------------------------------------------------------
@@ -365,7 +399,6 @@ with tab2:
 with tab3:
     st.subheader("Buyer vs. Seller")
     seller_row = secondary_pricing(net_nav, forecast_rows, as_of, [0.0], distribution_key, unfunded_calls)[0]
-    buyer_row = secondary_pricing(net_nav, forecast_rows, as_of, [buyer_target_discount], distribution_key, unfunded_calls)[0]
     bc1, bc2 = st.columns(2)
     with bc1:
         st.markdown("**Seller (holds at par to net NAV, 0% discount)**")
@@ -375,13 +408,42 @@ with tab3:
     with bc2:
         st.markdown(f"**Buyer (at a {buyer_target_discount*100:.0f}% discount to net NAV)**")
         st.metric("Purchase price", f"${buyer_row['price']:,.0f}")
-        st.metric("Projected IRR", f"{buyer_row['irr']*100:.1f}%" if buyer_row['irr'] == buyer_row['irr'] else "n/a")
-        st.metric("Projected MOIC", f"{buyer_row['moic']:.2f}x")
+        st.metric("Projected IRR (unlevered)", f"{buyer_row['irr']*100:.1f}%" if buyer_row['irr'] == buyer_row['irr'] else "n/a")
+        st.metric("Projected MOIC (unlevered)", f"{buyer_row['moic']:.2f}x")
+        if leverage_result:
+            lirr = leverage_result["levered_irr"]
+            st.metric(
+                f"Projected IRR (levered, {leverage_pct*100:.0f}% @ {leverage_rate*100:.1f}%)",
+                f"{lirr*100:.1f}%" if lirr == lirr else "n/a",
+                delta=f"{(lirr - buyer_row['irr'])*100:+.1f}pp vs. unlevered" if lirr == lirr else None,
+            )
+            st.metric(
+                f"Projected MOIC (levered)",
+                f"{leverage_result['levered_moic']:.2f}x",
+                delta=f"{leverage_result['levered_moic'] - buyer_row['moic']:+.2f}x vs. unlevered",
+            )
     st.caption(
         "Both sides project off the same underlying distributions; the Seller's figures are the "
         "'hold' case at the fund's net NAV, and the Buyer's figures show the extra return created "
-        "purely by the negotiated discount."
+        "purely by the negotiated discount. Levered figures (when a facility is enabled in the "
+        "sidebar) are shown alongside the unlevered ones, never in place of them -- they show how "
+        "much of the return is coming from financing rather than the underlying deal."
     )
+    if leverage_result:
+        with st.expander("Leverage facility schedule"):
+            lev_df = pd.DataFrame(leverage_result["schedule"])
+            st.dataframe(
+                lev_df.style.format({
+                    "beginning_balance": "${:,.0f}", "interest_accrued": "${:,.0f}",
+                    "interest_paid": "${:,.0f}", "principal_repaid": "${:,.0f}", "ending_balance": "${:,.0f}",
+                }),
+                width="stretch",
+            )
+            st.caption(
+                f"Initial draw ${leverage_result['initial_draw']:,.0f} at close; equity invested "
+                f"${leverage_result['equity_invested']:,.0f} (buyer's share of the purchase price "
+                f"plus all unfunded calls, which the facility does not finance)."
+            )
 
     st.subheader("Full pricing sensitivity")
     if total_unfunded > 0:
