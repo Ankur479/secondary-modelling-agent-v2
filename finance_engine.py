@@ -344,6 +344,95 @@ def build_unfunded_schedule(known_followons: List[Dict], blind_pool_amount: floa
 # Secondary pricing
 # ---------------------------------------------------------------------------
 
+def leverage_overlay(scenario: Dict, forecast_rows: List[Dict], as_of: date,
+                      distribution_key: str, unfunded_calls: Dict[int, float],
+                      leverage_pct: float, interest_rate: float) -> Dict:
+    """
+    Overlays debt financing on top of one secondary_pricing() scenario (e.g. the
+    buyer's row at a given discount): the buyer draws `leverage_pct` of the
+    purchase price at t=0 from a credit facility (a subscription line / NAV
+    facility) instead of funding the whole price with equity.
+
+    Repayment logic (documented, overridable assumption -- desks vary on how
+    aggressively they sweep): each period, whatever cash the fund actually
+    distributes net of that period's unfunded call (if positive) is swept to
+    pay accrued interest first, then principal, until the balance hits zero.
+    If a period's net cash flow is zero or negative (e.g. a call exceeds that
+    period's distribution), no debt service happens that period and the
+    accrued interest capitalizes into the balance rather than erroring.
+    The facility only finances the purchase price -- unfunded capital calls
+    are always funded directly by the equity holder, never by this facility.
+
+    Returns levered IRR/MOIC for the buyer's equity cash flows only, meant to
+    be shown ALONGSIDE (never instead of) the unlevered scenario['irr'] /
+    scenario['moic'] this was built from -- leverage changes the return
+    profile, not the underlying deal.
+
+    At leverage_pct = 0.0 this reproduces scenario['irr'] and scenario['moic']
+    exactly (same cash flows, same formulas) -- see test_leverage_overlay.py.
+    """
+    price = scenario["price"]
+    total_calls = scenario["unfunded_calls"]
+    initial_draw = price * leverage_pct
+    equity_at_t0 = price - initial_draw
+    equity_invested_total = equity_at_t0 + total_calls
+
+    balance = initial_draw
+    prev_date = as_of
+    schedule = []
+    levered_flows = [(as_of, -equity_at_t0)]
+    equity_returned_total = 0.0
+
+    for r in forecast_rows:
+        gross_dist = r[distribution_key]
+        call = unfunded_calls.get(r["year"], 0.0)
+        net_cf = gross_dist - call
+        period_years = max((r["date"] - prev_date).days, 0) / 365.0
+        beginning_balance = balance
+        interest_due = beginning_balance * interest_rate * period_years
+        cash_for_debt_service = max(net_cf, 0.0)
+
+        if cash_for_debt_service > 0:
+            interest_paid = min(cash_for_debt_service, interest_due)
+            principal_paid = min(cash_for_debt_service - interest_paid, balance)
+            unpaid_interest = interest_due - interest_paid
+        else:
+            interest_paid = 0.0
+            principal_paid = 0.0
+            unpaid_interest = interest_due
+        balance = balance - principal_paid + unpaid_interest
+
+        equity_received = gross_dist - interest_paid - principal_paid
+        equity_returned_total += equity_received
+        equity_cf_this_period = equity_received - call
+        levered_flows.append((r["date"], equity_cf_this_period))
+
+        schedule.append({
+            "year": r["year"],
+            "date": r["date"],
+            "beginning_balance": beginning_balance,
+            "interest_accrued": interest_due,
+            "interest_paid": interest_paid,
+            "principal_repaid": principal_paid,
+            "ending_balance": balance,
+        })
+        prev_date = r["date"]
+
+    levered_irr = xirr(levered_flows)
+    levered_moic = equity_returned_total / equity_invested_total if equity_invested_total else float("nan")
+
+    return {
+        "leverage_pct": leverage_pct,
+        "interest_rate": interest_rate,
+        "initial_draw": initial_draw,
+        "equity_invested": equity_invested_total,
+        "levered_irr": levered_irr,
+        "levered_moic": levered_moic,
+        "ending_balance": balance,
+        "schedule": schedule,
+    }
+
+
 def secondary_pricing(nav_current: float, forecast_rows: List[Dict], as_of: date,
                        discount_levels: List[float], distribution_key: str = "gross_distribution",
                        unfunded_calls: Dict[int, float] = None) -> List[Dict]:
