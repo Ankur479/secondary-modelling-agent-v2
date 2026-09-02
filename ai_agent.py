@@ -12,8 +12,10 @@ import os
 
 SYSTEM_PROMPT = """You are a private equity secondaries analyst assistant embedded in a modelling tool.
 You are given computed fund metrics: paid-in capital, distributions to date, DPI/RVPI/TVPI, IRR to
-date, a year-by-year forecast of future distributions and ending NAV, and a secondary pricing
-sensitivity table (buyer IRR/MOIC at various discounts or premiums to NAV).
+date, a year-by-year forecast of future distributions and ending NAV, a secondary pricing
+sensitivity table (buyer IRR/MOIC at various discounts or premiums to NAV), and, when the buyer is
+financing part of the purchase, a "leverage" block with unlevered vs. levered IRR/MOIC -- if asked
+about leverage or financing, use that block rather than estimating the effect yourself.
 
 Answer the user's question using ONLY the numbers in the provided context. Be precise and concise,
 and cite the specific figures you rely on. If asked for a judgment call (e.g. "is this a good deal"),
@@ -62,5 +64,14 @@ def _fallback_summary(metrics: dict) -> str:
             f"**Reference pricing:** at a {best.get('discount', 0)*100:.0f}% discount to NAV "
             f"(price ${best.get('price', 0):,.0f}), projected buyer IRR is {b_irr_txt} "
             f"with a {best.get('moic', 0):.2f}x MOIC."
+        )
+    lev = metrics.get("leverage")
+    if lev and lev.get("used"):
+        l_irr = lev.get("levered_irr")
+        l_irr_txt = f"{l_irr*100:.1f}%" if l_irr == l_irr else "n/a"
+        lines.append(
+            f"**Leverage:** with {lev.get('leverage_pct', 0)*100:.0f}% of the purchase price "
+            f"financed at {lev.get('interest_rate', 0)*100:.1f}%, projected buyer IRR moves from "
+            f"{lev.get('unlevered_irr', 0)*100:.1f}% (unlevered) to {l_irr_txt} (levered)."
         )
     return "\n\n".join(lines)
