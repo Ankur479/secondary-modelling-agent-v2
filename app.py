@@ -16,15 +16,18 @@ from ai_agent import ask_agent
 from finance_engine import (
     apply_carry_waterfall,
     apply_carry_waterfall_declining_balance,
+    asset_model_build,
+    asset_model_returns,
     build_unfunded_returns,
     build_unfunded_schedule,
     cash_flow_duration,
-    ebitda_exit_value,
+    crossover_fee_schedule,
     forecast_cashflows,
     forecast_from_portfolio,
     fund_metrics_to_date,
     implied_annual_return,
     leverage_overlay,
+    remaining_cost_basis_by_year,
     reported_vs_market_value,
     secondary_pricing,
 )
@@ -64,10 +67,10 @@ st.sidebar.caption(
     "is fund-level; the app scales it down to the selling LP's share automatically."
 )
 fund_commitment = st.sidebar.number_input(
-    "Fund total commitment ($)", min_value=0.01, value=50_000_000.0, step=1_000_000.0, format="%.0f"
+    "Fund total commitment ($)", min_value=0.01, value=1_014_700_000.0, step=1_000_000.0, format="%.0f"
 )
 lp_commitment = st.sidebar.number_input(
-    "Selling LP's commitment ($)", min_value=0.0, value=2_500_000.0, step=100_000.0, format="%.0f"
+    "Selling LP's commitment ($)", min_value=0.0, value=33_500_000.0, step=100_000.0, format="%.0f"
 )
 lp_pct = (lp_commitment / fund_commitment) if fund_commitment > 0 else 0.0
 st.sidebar.caption(f"LP ownership = {lp_pct*100:.2f}% of the fund")
@@ -80,11 +83,15 @@ forecast_mode = st.sidebar.radio(
     help="Portfolio mode lets each holding have its own growth rate, valuation "
          "adjustment, and exit timing instead of one shared NAV on a single runoff curve.",
 )
-as_of = st.sidebar.date_input("As-of date", value=date.today())
+as_of = st.sidebar.date_input("As-of date", value=date(2025, 12, 31))
+st.sidebar.caption(
+    "Forecast year 1 is the calendar year after this date, so with the default as-of date "
+    "the projection columns run 2026 onward -- the same grid the asset models use."
+)
 
 if forecast_mode == "Aggregate NAV (simple)":
     nav_current = st.sidebar.number_input(
-        "Current NAV / Reported Value ($)", min_value=0.0, value=62_000_000.0, step=1_000_000.0, format="%.0f"
+        "Current NAV / Reported Value ($)", min_value=0.0, value=657_300_000.0, step=1_000_000.0, format="%.0f"
     )
 else:
     nav_current = None  # computed below from the portfolio companies table
@@ -122,17 +129,26 @@ else:
         "Portfolio companies - Reported Value is the GP's official mark; MV Adjustment "
         "lets you apply your own diligence-based view on top of it."
     )
+    # Defaults are the five current investments of the source deal, at fund level.
+    # Cost / Reported Value / Market Value and the investment dates come straight from
+    # the Fund Model's "Current Investments" block; Exit Year 1 is that company's exit
+    # calendar year expressed as a forecast year off the as-of date (2028 -> 3, etc.).
     default_portfolio = pd.DataFrame([
-        {"Company": "Company A", "Reported Value ($M)": 15.0, "MV Adjustment (%)": 0.0,
+        {"Company": "Asset A", "Investment Date": date(2022, 3, 1), "Cost Basis ($M)": 77.0,
+         "Reported Value ($M)": 188.0, "MV Adjustment (%)": 0.0,
          "Expected Return (%)": 25.0, "Exit Year 1": 3, "Exit % 1": 100.0, "Exit Year 2": 3, "Exit % 2": 0.0},
-        {"Company": "Company B", "Reported Value ($M)": 12.0, "MV Adjustment (%)": -10.0,
-         "Expected Return (%)": 18.0, "Exit Year 1": 3, "Exit % 1": 50.0, "Exit Year 2": 5, "Exit % 2": 100.0},
-        {"Company": "Company C", "Reported Value ($M)": 10.0, "MV Adjustment (%)": 5.0,
-         "Expected Return (%)": 10.0, "Exit Year 1": 2, "Exit % 1": 100.0, "Exit Year 2": 2, "Exit % 2": 0.0},
-        {"Company": "Company D", "Reported Value ($M)": 15.0, "MV Adjustment (%)": 0.0,
-         "Expected Return (%)": 20.0, "Exit Year 1": 4, "Exit % 1": 100.0, "Exit Year 2": 4, "Exit % 2": 0.0},
-        {"Company": "Company E", "Reported Value ($M)": 10.0, "MV Adjustment (%)": -5.0,
+        {"Company": "Asset B", "Investment Date": date(2023, 1, 1), "Cost Basis ($M)": 115.0,
+         "Reported Value ($M)": 132.0, "MV Adjustment (%)": 0.0,
          "Expected Return (%)": 12.0, "Exit Year 1": 5, "Exit % 1": 100.0, "Exit Year 2": 5, "Exit % 2": 0.0},
+        {"Company": "Asset C", "Investment Date": date(2022, 10, 1), "Cost Basis ($M)": 62.0,
+         "Reported Value ($M)": 122.0, "MV Adjustment (%)": 6.5574,
+         "Expected Return (%)": 20.0, "Exit Year 1": 1, "Exit % 1": 100.0, "Exit Year 2": 1, "Exit % 2": 0.0},
+        {"Company": "Asset D", "Investment Date": date(2024, 2, 1), "Cost Basis ($M)": 84.9,
+         "Reported Value ($M)": 110.2, "MV Adjustment (%)": 0.0,
+         "Expected Return (%)": 25.0, "Exit Year 1": 4, "Exit % 1": 100.0, "Exit Year 2": 4, "Exit % 2": 0.0},
+        {"Company": "Asset E", "Investment Date": date(2024, 6, 1), "Cost Basis ($M)": 87.5,
+         "Reported Value ($M)": 105.1, "MV Adjustment (%)": 0.0,
+         "Expected Return (%)": 12.0, "Exit Year 1": 6, "Exit % 1": 100.0, "Exit Year 2": 6, "Exit % 2": 0.0},
     ])
     portfolio_df = st.sidebar.data_editor(
         default_portfolio, num_rows="dynamic", width="stretch", key="portfolio_editor"
@@ -144,61 +160,24 @@ else:
         nav_current = 0.0
         remaining_years = 1
     st.sidebar.caption(f"Aggregate Reported NAV from portfolio: ${nav_current:,.0f}")
-
-    valuation_method = st.sidebar.radio(
-        "Company valuation method",
-        ["Expected Return % (simple)", "Bottom-up EV/EBITDA model (detailed)"],
-        index=0,
-        help="Simple: use the flat 'Expected Return (%)' column above directly. Detailed: "
-             "build each company's own Revenue -> EBITDA -> FCF -> Exit EV/EBITDA model below; "
-             "the app backs out the equivalent annualized return and uses that instead (the "
-             "'Expected Return (%)' column above is then ignored for companies with a matching "
-             "row here). Exit timing (Exit Year 1) still comes from the table above.",
+    st.sidebar.caption(
+        "Add a row here and a full bottom-up model for that company appears in the "
+        "**Asset Model (Bottom-up)** tab, where its operating build and exit valuation are "
+        "set. Whatever each asset model projects drives that company's return here."
     )
-    ebitda_df = None
-    if valuation_method.startswith("Bottom-up"):
-        st.sidebar.write("EV/EBITDA build per company (Company name must match the table above):")
-        default_ebitda = pd.DataFrame([
-            # Entry Revenue chosen so Entry Equity Value x Fund Ownership % lands close to
-            # each company's default Reported Value above -- otherwise the implied return
-            # comes out absurd purely from a scale mismatch between the two tables. Adjust
-            # freely; the two tables just need to describe the same company consistently.
-            {"Company": "Company A", "Entry Revenue ($M)": 10.7, "Entry EBITDA Margin (%)": 25.0,
-             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
-             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
-            {"Company": "Company B", "Entry Revenue ($M)": 7.7, "Entry EBITDA Margin (%)": 25.0,
-             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
-             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
-            {"Company": "Company C", "Entry Revenue ($M)": 7.5, "Entry EBITDA Margin (%)": 25.0,
-             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
-             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
-            {"Company": "Company D", "Entry Revenue ($M)": 10.7, "Entry EBITDA Margin (%)": 25.0,
-             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
-             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
-            {"Company": "Company E", "Entry Revenue ($M)": 6.8, "Entry EBITDA Margin (%)": 25.0,
-             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
-             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
-        ])
-        ebitda_df = st.sidebar.data_editor(
-            default_ebitda, num_rows="dynamic", width="stretch", key="ebitda_editor"
-        )
-        st.sidebar.caption(
-            "Exit value = (Exit EBITDA x Exit EV/EBITDA multiple - Net Debt at exit) x Fund "
-            "Ownership %. Net Debt pays down by that year's FCF each year (floored at zero). "
-            "The app then solves for the flat annual rate that compounds the company's current "
-            "Market Value (from the table above) to this exit value by Exit Year 1."
-        )
 
 st.sidebar.header("4. Unfunded commitment")
 st.sidebar.write("Known follow-on investments (already identified):")
 default_followons = pd.DataFrame([
-    {"Name": "Follow-on A", "Amount ($M)": 2.0, "Year": 1},
+    # The source model's post-report-date investment: a new company committed after the
+    # reporting date, funded in the first forecast year.
+    {"Name": "Asset F (post-report)", "Amount ($M)": 90.0, "Year": 1},
 ])
 known_followons_df = st.sidebar.data_editor(
     default_followons, num_rows="dynamic", width="stretch", key="followons_editor"
 )
 blind_pool_amount = st.sidebar.number_input(
-    "Blind pool (unidentified future calls, $)", min_value=0.0, value=0.0, step=500_000.0, format="%.0f"
+    "Blind pool (unidentified future calls, $)", min_value=0.0, value=374_800_000.0, step=500_000.0, format="%.0f"
 )
 if blind_pool_amount > 0:
     blind_pool_years = st.sidebar.slider(
@@ -212,15 +191,15 @@ st.sidebar.caption(
 )
 
 unfunded_generates_return = st.sidebar.checkbox(
-    "Unfunded commitment generates its own return", value=False,
+    "Unfunded commitment generates its own return", value=True,
     help="A capital call doesn't just sit as an outflow -- it funds a new investment that "
          "itself goes on to return money. Turn this on to project a return on every future "
          "call, a fixed hold period and MOIC after which it lands.",
 )
 if unfunded_generates_return:
     uc1, uc2 = st.sidebar.columns(2)
-    unfunded_hold_years = uc1.number_input("Hold period (years)", min_value=1, value=3, step=1)
-    unfunded_moic = uc2.number_input("Assumed MOIC (x)", min_value=0.1, value=1.5, step=0.1, format="%.1f")
+    unfunded_hold_years = uc1.number_input("Hold period (years)", min_value=1, value=4, step=1)
+    unfunded_moic = uc2.number_input("Assumed MOIC (x)", min_value=0.1, value=1.75, step=0.05, format="%.2f")
     st.sidebar.caption(
         "Each call in year Y returns amount x MOIC in year Y + hold period. Calls that would "
         "mature beyond the forecast horizon are excluded (flagged below) rather than distorting "
@@ -232,7 +211,57 @@ else:
 
 st.sidebar.header("5. Fees & carried interest")
 apply_fees = st.sidebar.checkbox("Apply management fee & carry", value=True)
-mgmt_fee = st.sidebar.slider("Annual management fee (%)", 0.0, 5.0, 2.0, step=0.25) / 100
+
+use_two_tier_fee = False
+crossover_year = 1
+fee_rate_initial = 0.0
+fee_rate_post = 0.0
+if apply_fees and forecast_mode == "Portfolio companies (detailed)":
+    fee_structure = st.sidebar.radio(
+        "Management fee basis",
+        ["Flat annual fee (% of NAV)", "Two-tier: flat on commitment, then step-down on remaining cost"],
+        index=0,
+        help="Flat: the classic simple case, a single rate charged on the year's grown NAV "
+             "(what the 'Annual management fee' slider below controls). Two-tier: mirrors a "
+             "common real fund schedule -- a flat rate on the FUND'S TOTAL COMMITMENT during "
+             "the investment period, then from a chosen crossover year onward, a (usually "
+             "lower) rate on each company's remaining invested COST basis, which shrinks as "
+             "companies exit. Requires a Cost Basis ($M) per company in the table above.",
+    )
+    use_two_tier_fee = fee_structure.startswith("Two-tier")
+    if use_two_tier_fee:
+        fc1, fc2 = st.sidebar.columns(2)
+        fee_rate_initial = fc1.number_input(
+            "Fee rate, investment period (% of commitment)", min_value=0.0, max_value=5.0,
+            value=1.9, step=0.1, format="%.1f",
+        ) / 100
+        fee_rate_post = fc2.number_input(
+            "Fee rate, post-crossover (% of remaining cost)", min_value=0.0, max_value=5.0,
+            value=1.9, step=0.1, format="%.1f",
+        ) / 100
+        crossover_year = st.sidebar.slider(
+            "Crossover year (step-down starts here)", 1, max(1, remaining_years),
+            min(2, max(1, remaining_years)),
+            help="Forecast year in which the fee basis switches from total commitment to "
+                 "remaining cost basis. Typically the end of the fund's investment period.",
+        )
+        st.sidebar.caption(
+            "Before the crossover year: fee = rate x fund's total commitment (LP share). "
+            "From the crossover year on: fee = rate x that year's remaining cost basis "
+            "(sum of Cost Basis for companies not yet exited -- a company still counts in "
+            "full during its own exit year, then drops out the year after)."
+        )
+    mgmt_fee = st.sidebar.slider(
+        "Annual management fee (%)", 0.0, 5.0, 2.0, step=0.25,
+        help="Used when 'Flat annual fee' is selected above.",
+    ) / 100
+else:
+    mgmt_fee = st.sidebar.slider("Annual management fee (%)", 0.0, 5.0, 2.0, step=0.25) / 100
+    if apply_fees:
+        st.sidebar.caption(
+            "Two-tier (step-down on remaining cost) fee basis is available in Portfolio "
+            "companies (detailed) mode, since it needs each company's cost basis."
+        )
 hurdle_rate = st.sidebar.slider("Preferred return / hurdle (%)", 0.0, 15.0, 8.0, step=0.5) / 100
 carry_rate = st.sidebar.slider("Carried interest (%)", 0.0, 30.0, 20.0, step=1.0) / 100
 accrued_carry = st.sidebar.number_input(
@@ -288,6 +317,282 @@ api_key = st.sidebar.text_input("Anthropic API key (optional)", type="password")
 st.sidebar.caption("No key? The assistant still answers using a rule-based summary of the numbers.")
 
 # --------------------------------------------------------------------------
+# Tabs
+# --------------------------------------------------------------------------
+# Created up front because the Asset Model tab is rendered FIRST, before the core
+# calculations below: each asset's bottom-up build is what sets that company's
+# expected return, so its inputs have to be read before the fund-level forecast
+# runs. Streamlit lets a tab be written into at any point in the script, so the
+# remaining tabs are filled in further down, after the numbers exist.
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "Asset Model (Bottom-up)", "AI Assistant"]
+)
+
+# --------------------------------------------------------------------------
+# Asset Model (Bottom-up) -- one full company model per portfolio holding
+# --------------------------------------------------------------------------
+# Per-asset defaults for the five current investments of the source deal. Anything
+# not listed here (a company you add to the portfolio table) gets a generic default
+# sized off its own Reported Value, so a new row never starts out absurd.
+ASSET_DEFAULTS = {
+    "Asset A": {"entry_revenue": 98.1, "prior_proceeds": 238.1},
+    "Asset B": {"entry_revenue": 68.8, "prior_proceeds": 214.2},
+    "Asset C": {"entry_revenue": 83.8, "prior_proceeds": 153.9},
+    "Asset D": {"entry_revenue": 102.4, "prior_proceeds": 282.5},
+    "Asset E": {"entry_revenue": 53.5, "prior_proceeds": 187.4},
+}
+COMMON_DEFAULTS = {
+    "entry_ebitda_margin": 25.0, "entry_ev_multiple": 11.0, "entry_net_debt_ebitda": 3.0,
+    "fund_ownership": 70.0, "exit_ev_multiple": 12.0, "revenue_growth": 8.0,
+    "ebitda_margin": 25.0, "fcf_conversion": 50.0,
+}
+
+asset_builds = {}  # company name -> {"build": ..., "returns": ..., "drives_forecast": bool}
+
+with tab4:
+    st.subheader("Asset Model (Bottom-up)")
+    if forecast_mode != "Portfolio companies (detailed)":
+        st.info(
+            "Switch **Forecast mode** to *Portfolio companies (detailed)* in the sidebar to "
+            "model each holding bottom-up. In Aggregate NAV mode the fund is projected off a "
+            "single NAV and runoff curve instead, so there are no individual assets to build."
+        )
+    elif portfolio_df is None or len(portfolio_df) == 0:
+        st.info("Add at least one company to the portfolio table in the sidebar.")
+    else:
+        st.caption(
+            "One model per holding, in $mm at fund level, laid out exactly like the source "
+            "workbook's per-asset tabs. Deal Snapshot is pulled from the portfolio table in the "
+            "sidebar (one source of truth for cost, marks and exit timing); everything below it "
+            "is set here. **Add or remove companies by adding or removing rows in that sidebar "
+            "table** -- a model appears here for each one automatically."
+        )
+        proj_years = [as_of.year + t for t in range(1, max(1, remaining_years) + 1)]
+        total_rv = float(portfolio_df["Reported Value ($M)"].sum())
+
+        for _, prow in portfolio_df.iterrows():
+            name = str(prow["Company"])
+            rv_m = float(prow["Reported Value ($M)"])
+            cost_m = float(prow.get("Cost Basis ($M)", 0.0))
+            adj_pct = float(prow["MV Adjustment (%)"])
+            mv_m = rv_m * (1 + adj_pct / 100)
+            exit_rel = int(prow["Exit Year 1"])
+            exit_cal = as_of.year + exit_rel
+            inv_date = prow.get("Investment Date")
+            try:
+                inv_year = pd.to_datetime(inv_date).year
+                inv_date_label = pd.to_datetime(inv_date).strftime("%Y-%m-%d")
+            except Exception:
+                inv_year = as_of.year
+                inv_date_label = "--"
+            hold_years = max(0, exit_cal - inv_year)
+
+            d = ASSET_DEFAULTS.get(name, {})
+            # A generic new company: entry equity x ownership lands near its Reported Value,
+            # so the implied return starts sane instead of wild.
+            default_revenue = d.get("entry_revenue", round(rv_m / 1.4, 1) if rv_m > 0 else 10.0)
+            default_prior = d.get("prior_proceeds", 0.0)
+
+            with st.expander(f"{name}", expanded=False):
+                drives = st.checkbox(
+                    "Use this asset model to drive the fund forecast", value=True,
+                    key=f"am_{name}_drives",
+                    help="On: this company's expected return in the forecast is whatever this "
+                         "model implies (its exit proceeds compounded back from today's Market "
+                         "Value). Off: the flat 'Expected Return (%)' from the sidebar table is "
+                         "used instead, and this model is display-only.",
+                )
+
+                st.markdown("**Deal Snapshot**")
+                snapshot = pd.DataFrame([
+                    {"Line item": "Investment Date", "Value": inv_date_label},
+                    {"Line item": "LP Cost ($mm, gross)", "Value": f"{cost_m:,.1f}"},
+                    {"Line item": "Reported Value (RV)", "Value": f"{rv_m:,.1f}"},
+                    {"Line item": "Market Value (MV)", "Value": f"{mv_m:,.1f}"},
+                    {"Line item": "% of Fund RV", "Value": f"{(rv_m / total_rv * 100) if total_rv else 0:,.2f}%"},
+                    {"Line item": "Exit Year", "Value": f"{exit_cal}"},
+                    {"Line item": "Hold Period (yrs, from inv. date)", "Value": f"{hold_years}"},
+                ])
+                st.dataframe(snapshot, width="stretch", hide_index=True)
+                st.caption(
+                    "Pulled from the sidebar portfolio table -- edit it there. Exit Year is that "
+                    f"row's Exit Year 1 ({exit_rel}) counted off the as-of date."
+                )
+
+                st.markdown("**Entry Assumptions**")
+                e1, e2, e3 = st.columns(3)
+                entry_revenue = e1.number_input(
+                    "Entry Revenue ($mm)", min_value=0.0, value=float(default_revenue), step=0.1,
+                    format="%.1f", key=f"am_{name}_entry_rev",
+                )
+                entry_margin = e2.number_input(
+                    "Entry EBITDA Margin (%)", min_value=0.0, max_value=100.0,
+                    value=COMMON_DEFAULTS["entry_ebitda_margin"], step=0.5, format="%.1f",
+                    key=f"am_{name}_entry_margin",
+                )
+                entry_ev_mult = e3.number_input(
+                    "Entry EV/EBITDA (x)", min_value=0.0, value=COMMON_DEFAULTS["entry_ev_multiple"],
+                    step=0.5, format="%.1f", key=f"am_{name}_entry_ev",
+                )
+                e4, e5 = st.columns(2)
+                entry_nd_mult = e4.number_input(
+                    "Entry Net Debt / EBITDA (x)", min_value=0.0,
+                    value=COMMON_DEFAULTS["entry_net_debt_ebitda"], step=0.25, format="%.2f",
+                    key=f"am_{name}_entry_nd",
+                )
+                fund_ownership = e5.number_input(
+                    "Fund Ownership (%)", min_value=0.0, max_value=100.0,
+                    value=COMMON_DEFAULTS["fund_ownership"], step=1.0, format="%.1f",
+                    key=f"am_{name}_ownership",
+                )
+
+                st.markdown("**Operating Projections ($mm)**")
+                default_ops = pd.DataFrame(
+                    [
+                        {"Line item": "Revenue Growth (%)",
+                         **{str(y): COMMON_DEFAULTS["revenue_growth"] for y in proj_years}},
+                        {"Line item": "EBITDA Margin (%)",
+                         **{str(y): COMMON_DEFAULTS["ebitda_margin"] for y in proj_years}},
+                        {"Line item": "FCF Conversion (% of EBITDA)",
+                         **{str(y): COMMON_DEFAULTS["fcf_conversion"] for y in proj_years}},
+                    ]
+                )
+                ops_df = st.data_editor(
+                    default_ops, width="stretch", hide_index=True, key=f"am_{name}_ops",
+                    disabled=["Line item"],
+                )
+
+                def _row_vals(frame, label, fallback):
+                    match = frame[frame["Line item"] == label]
+                    if len(match) == 0:
+                        return [fallback / 100] * len(proj_years)
+                    r = match.iloc[0]
+                    out = []
+                    for y in proj_years:
+                        try:
+                            out.append(float(r[str(y)]) / 100)
+                        except (KeyError, TypeError, ValueError):
+                            out.append(fallback / 100)
+                    return out
+
+                growth_v = _row_vals(ops_df, "Revenue Growth (%)", COMMON_DEFAULTS["revenue_growth"])
+                margin_v = _row_vals(ops_df, "EBITDA Margin (%)", COMMON_DEFAULTS["ebitda_margin"])
+                conv_v = _row_vals(ops_df, "FCF Conversion (% of EBITDA)", COMMON_DEFAULTS["fcf_conversion"])
+
+                st.markdown("**Exit Valuation**")
+                exit_ev_mult = st.number_input(
+                    "Exit EV/EBITDA (x)", min_value=0.0, value=COMMON_DEFAULTS["exit_ev_multiple"],
+                    step=0.5, format="%.1f", key=f"am_{name}_exit_ev",
+                )
+
+                build = asset_model_build(
+                    entry_revenue=entry_revenue,
+                    entry_ebitda_margin=entry_margin / 100,
+                    entry_ev_multiple=entry_ev_mult,
+                    entry_net_debt_ebitda=entry_nd_mult,
+                    fund_ownership_pct=fund_ownership / 100,
+                    years=proj_years,
+                    revenue_growth=growth_v,
+                    ebitda_margin=margin_v,
+                    fcf_conversion=conv_v,
+                    exit_year=exit_cal,
+                    exit_ev_multiple=exit_ev_mult,
+                )
+
+                # Entry block, computed -- shown under its inputs so the build reads top to bottom.
+                entry_calc = pd.DataFrame([
+                    {"Line item": "Entry EBITDA", "Value": build["entry_ebitda"]},
+                    {"Line item": "Entry Enterprise Value", "Value": build["entry_enterprise_value"]},
+                    {"Line item": "Entry Net Debt", "Value": build["entry_net_debt"]},
+                    {"Line item": "Entry Equity Value", "Value": build["entry_equity_value"]},
+                ])
+
+                sched = pd.DataFrame(build["schedule"])
+                ops_out = pd.DataFrame(
+                    [
+                        {"Line item": "Revenue", **{str(r["year"]): r["revenue"] for r in build["schedule"]}},
+                        {"Line item": "EBITDA", **{str(r["year"]): r["ebitda"] for r in build["schedule"]}},
+                        {"Line item": "Free Cash Flow", **{str(r["year"]): r["fcf"] for r in build["schedule"]}},
+                        {"Line item": "Net Debt - Beginning",
+                         **{str(r["year"]): r["net_debt_beginning"] for r in build["schedule"]}},
+                        {"Line item": "Less: Debt Paydown (FCF)",
+                         **{str(r["year"]): r["debt_paydown"] for r in build["schedule"]}},
+                        {"Line item": "Net Debt - Ending",
+                         **{str(r["year"]): r["net_debt_ending"] for r in build["schedule"]}},
+                    ]
+                )
+
+                if not build["exit_year_in_horizon"]:
+                    st.warning(
+                        f"Exit year {exit_cal} falls outside the projection columns "
+                        f"({proj_years[0]}-{proj_years[-1]}). Extend the forecast horizon by "
+                        "moving this company's Exit Year 1 inside it."
+                    )
+                exit_calc = pd.DataFrame([
+                    {"Line item": "Exit EBITDA", "Value": build["exit_ebitda"]},
+                    {"Line item": "Exit EV/EBITDA (x)", "Value": exit_ev_mult},
+                    {"Line item": "Exit Enterprise Value", "Value": build["exit_enterprise_value"]},
+                    {"Line item": "Less: Net Debt at Exit", "Value": build["net_debt_at_exit"]},
+                    {"Line item": "Exit Equity Value", "Value": build["exit_equity_value"]},
+                    {"Line item": "Fund Ownership (%)", "Value": fund_ownership},
+                    {"Line item": "Gross Proceeds to Fund ($mm)", "Value": build["gross_proceeds_to_fund"]},
+                ])
+
+                st.markdown("**Returns & Tie-Out**")
+                prior_proceeds = st.number_input(
+                    "Prior Fund Model Proceeds (hardcode)", value=float(default_prior), step=0.1,
+                    format="%.1f", key=f"am_{name}_prior",
+                    help="What this asset's proceeds were in the last version of the fund model "
+                         "circulated. Kept as a hardcode so a re-run can be diffed against what "
+                         "the client last saw. Set to 0 to ignore.",
+                )
+                rets = asset_model_returns(
+                    build["gross_proceeds_to_fund"], cost_m, rv_m, hold_years,
+                    prior_proceeds if prior_proceeds != 0 else None,
+                )
+
+                # --- render the computed blocks, in the source model's order ---
+                st.markdown("_Entry Assumptions (computed)_")
+                st.dataframe(entry_calc.style.format({"Value": "{:,.3f}"}), width="stretch", hide_index=True)
+                st.markdown("_Operating Projections (computed)_")
+                st.dataframe(
+                    ops_out.style.format({str(y): "{:,.2f}" for y in proj_years}),
+                    width="stretch", hide_index=True,
+                )
+                st.markdown("_Exit Valuation (computed)_")
+                st.dataframe(exit_calc.style.format({"Value": "{:,.3f}"}), width="stretch", hide_index=True)
+
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Gross MOIC (vs Cost)",
+                          f"{rets['gross_moic_vs_cost']:.2f}x" if rets["gross_moic_vs_cost"] is not None else "NM")
+                r2.metric("Multiple on RV",
+                          f"{rets['multiple_on_rv']:.2f}x" if rets["multiple_on_rv"] is not None else "NM")
+                r3.metric("Gross IRR (annualised)",
+                          f"{rets['gross_irr_annualised']*100:.1f}%" if rets["gross_irr_annualised"] is not None else "NM")
+                r4.metric("Variance vs Prior",
+                          f"{rets['variance_vs_prior']:+,.2f}" if rets["variance_vs_prior"] is not None else "--")
+
+                st.markdown("**Cash Flow to Fund Model**")
+                cf_out = pd.DataFrame([
+                    {"Line item": "Exit Proceeds to Fund",
+                     **{str(r["year"]): r["exit_proceeds_to_fund"] for r in build["cash_flow_to_fund"]}},
+                ])
+                st.dataframe(
+                    cf_out.style.format({str(y): "{:,.2f}" for y in proj_years}),
+                    width="stretch", hide_index=True,
+                )
+                st.caption(
+                    "Fund-level $mm. The selling LP's share of this is what reaches the Cash Flow "
+                    f"Forecast tab: {lp_pct*100:.2f}% = "
+                    f"${build['gross_proceeds_to_fund'] * lp_pct:,.2f}mm in {exit_cal}."
+                )
+
+                asset_builds[name] = {
+                    "build": build, "returns": rets, "drives_forecast": drives,
+                    "exit_cal_year": exit_cal, "hold_years": hold_years, "cost_m": cost_m, "rv_m": rv_m,
+                }
+
+# --------------------------------------------------------------------------
 # Core calculations
 # --------------------------------------------------------------------------
 # Fund -> LP scaling happens once, right here, for every fund-level $ figure
@@ -302,7 +607,8 @@ accrued_carry_lp = accrued_carry * lp_pct
 
 to_date = fund_metrics_to_date(cf_dates, calls_lp, dists_lp, nav_current_lp, as_of)
 
-ebitda_details = []  # per-company EV/EBITDA build detail, for tab2 display
+asset_model_details = []  # per-company bottom-up build detail, for display
+fee_schedule_display = None  # two-tier management fee schedule, for tab2 display
 if forecast_mode == "Aggregate NAV (simple)":
     forecast_rows = forecast_cashflows(
         nav_current_lp, remaining_years, gross_return, shape, as_of,
@@ -310,10 +616,6 @@ if forecast_mode == "Aggregate NAV (simple)":
     )
     portfolio_display = None
 else:
-    ebitda_lookup = {}
-    if ebitda_df is not None and len(ebitda_df) > 0:
-        ebitda_lookup = {r["Company"]: r for _, r in ebitda_df.iterrows()}
-
     companies = []
     portfolio_display_rows = []
     for _, row in portfolio_df.iterrows():
@@ -323,28 +625,28 @@ else:
         mv_lp = mv * lp_pct
         exit_year_1 = int(row["Exit Year 1"])
 
+        # Each company's return comes from its bottom-up asset model (built in the
+        # Asset Model tab above) unless that model is switched off, in which case the
+        # flat Expected Return (%) from this table is the fallback.
         expected_return = float(row["Expected Return (%)"]) / 100
-        used_ebitda_model = False
-        e = ebitda_lookup.get(row["Company"])
-        if e is not None:
-            ev_result = ebitda_exit_value(
-                entry_revenue=float(e["Entry Revenue ($M)"]) * 1_000_000,
-                entry_ebitda_margin=float(e["Entry EBITDA Margin (%)"]) / 100,
-                entry_ev_multiple=float(e["Entry EV/EBITDA (x)"]),
-                entry_net_debt_ebitda=float(e["Entry Net Debt/EBITDA (x)"]),
-                revenue_growth=float(e["Revenue Growth (%)"]) / 100,
-                fcf_conversion=float(e["FCF Conversion (%)"]) / 100,
-                exit_year=exit_year_1,
-                exit_ev_multiple=float(e["Exit EV/EBITDA (x)"]),
-                fund_ownership_pct=float(e["Fund Ownership (%)"]) / 100,
-            )
-            exit_proceeds_lp = ev_result["exit_proceeds_to_fund"] * lp_pct
+        used_asset_model = False
+        am = asset_builds.get(str(row["Company"]))
+        if am is not None and am["drives_forecast"] and am["build"]["exit_year_in_horizon"]:
+            exit_proceeds_lp = am["build"]["gross_proceeds_to_fund"] * 1_000_000 * lp_pct
             expected_return = implied_annual_return(mv_lp, exit_proceeds_lp, exit_year_1)
-            used_ebitda_model = True
-            ebitda_details.append({
-                "Company": row["Company"], **ev_result, "implied_return": expected_return,
+            used_asset_model = True
+            asset_model_details.append({
+                "Company": row["Company"],
+                "exit_year": am["exit_cal_year"],
+                "gross_proceeds_to_fund": am["build"]["gross_proceeds_to_fund"] * 1_000_000,
                 "exit_proceeds_to_fund_lp": exit_proceeds_lp,
+                "implied_return": expected_return,
+                "gross_moic_vs_cost": am["returns"]["gross_moic_vs_cost"],
+                "gross_irr_annualised": am["returns"]["gross_irr_annualised"],
             })
+
+        cost = float(row.get("Cost Basis ($M)", 0.0)) * 1_000_000
+        cost_lp = cost * lp_pct
 
         companies.append({
             "name": row["Company"],
@@ -354,15 +656,41 @@ else:
             "exit_pct_1": float(row["Exit % 1"]) / 100,
             "exit_year_2": int(row["Exit Year 2"]),
             "exit_pct_2": float(row["Exit % 2"]) / 100,
+            "cost": cost_lp,
         })
         portfolio_display_rows.append({
-            "Company": row["Company"], "Reported Value (Fund)": rv, "MV Adjustment": adj,
-            "Market Value (Fund)": mv, "Market Value (LP)": mv_lp,
-            "Valuation method": "EV/EBITDA model" if used_ebitda_model else "Expected Return %",
+            "Company": row["Company"], "Cost Basis (Fund)": cost, "Reported Value (Fund)": rv,
+            "MV Adjustment": adj, "Market Value (Fund)": mv, "Market Value (LP)": mv_lp,
+            "Unrealized MOIC (RV/Cost)": (rv / cost) if cost > 0 else None,
+            "Valuation method": "Asset model (bottom-up)" if used_asset_model else "Expected Return %",
             "Return used": expected_return,
         })
+
+    fee_override_by_year = None
+    fee_schedule_display = None
+    if apply_fees and use_two_tier_fee and companies:
+        max_year = max(max(int(c["exit_year_1"]), int(c["exit_year_2"])) for c in companies)
+        max_year = max(1, max_year)
+        remaining_cost = remaining_cost_basis_by_year(companies, max_year)
+        fee_override_by_year = crossover_fee_schedule(
+            total_commitment=lp_commitment, remaining_cost_by_year=remaining_cost,
+            crossover_year=crossover_year, fee_rate_initial=fee_rate_initial,
+            fee_rate_post=fee_rate_post,
+        )
+        fee_schedule_display = pd.DataFrame([
+            {
+                "Year": t,
+                "Basis": "Commitment (investment period)" if t < crossover_year else "Remaining cost basis",
+                "Fee rate": fee_rate_initial if t < crossover_year else fee_rate_post,
+                "Fee basis ($)": lp_commitment if t < crossover_year else remaining_cost[t],
+                "Fee ($)": fee_override_by_year[t],
+            }
+            for t in sorted(fee_override_by_year)
+        ])
+
     forecast_rows = forecast_from_portfolio(
-        companies, mgmt_fee_rate=mgmt_fee if apply_fees else 0.0, as_of=as_of
+        companies, mgmt_fee_rate=mgmt_fee if apply_fees else 0.0, as_of=as_of,
+        fee_override_by_year=fee_override_by_year,
     )
     portfolio_display = pd.DataFrame(portfolio_display_rows)
 
@@ -462,6 +790,10 @@ metrics_context = {
         "shape": shape,
         "fees_applied": apply_fees,
         "mgmt_fee": mgmt_fee,
+        "use_two_tier_fee": use_two_tier_fee,
+        "two_tier_fee_rate_initial": fee_rate_initial if use_two_tier_fee else None,
+        "two_tier_fee_rate_post_crossover": fee_rate_post if use_two_tier_fee else None,
+        "two_tier_fee_crossover_year": crossover_year if use_two_tier_fee else None,
         "hurdle_rate": hurdle_rate,
         "carry_rate": carry_rate,
         "accrued_carry_to_date": accrued_carry_lp,
@@ -503,12 +835,8 @@ metrics_context = {
 }
 
 # --------------------------------------------------------------------------
-# Tabs
+# Tab content (the tabs themselves were created above the Asset Model section)
 # --------------------------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "Analytics & Pricing Bridge", "AI Assistant"]
-)
-
 with tab1:
     st.caption(
         f"Fund commitment ${fund_commitment:,.0f} | Selling LP's commitment ${lp_commitment:,.0f} "
@@ -544,35 +872,41 @@ with tab2:
         st.write("Reported Value vs. buyer-adjusted Market Value per company (Fund-level and the selling LP's share):")
         st.dataframe(
             portfolio_display.style.format({
-                "Reported Value (Fund)": "${:,.0f}", "Market Value (Fund)": "${:,.0f}",
-                "Market Value (LP)": "${:,.0f}", "MV Adjustment": "{:+.0%}", "Return used": "{:+.1%}",
+                "Cost Basis (Fund)": "${:,.0f}", "Reported Value (Fund)": "${:,.0f}",
+                "Market Value (Fund)": "${:,.0f}", "Market Value (LP)": "${:,.0f}",
+                "Unrealized MOIC (RV/Cost)": "{:.2f}x", "MV Adjustment": "{:+.0%}", "Return used": "{:+.1%}",
             }),
             width="stretch",
         )
-        if ebitda_details:
-            with st.expander("Bottom-up EV/EBITDA build detail"):
-                for d in ebitda_details:
-                    st.markdown(f"**{d['Company']}**")
-                    ec1, ec2, ec3, ec4 = st.columns(4)
-                    ec1.metric("Entry Equity Value", f"${d['entry_equity_value']:,.0f}")
-                    ec2.metric("Exit EBITDA", f"${d['exit_ebitda']:,.0f}")
-                    ec3.metric("Exit Equity Value", f"${d['exit_equity_value']:,.0f}")
-                    ec4.metric("Implied annual return", f"{d['implied_return']*100:.1f}%")
-                    st.caption(
-                        f"Exit proceeds to fund ${d['exit_proceeds_to_fund']:,.0f} at year "
-                        f"{d['exit_year']} -> LP share ${d['exit_proceeds_to_fund_lp']:,.0f}. This "
-                        f"implied return is what compounds the company's LP-level current Market "
-                        f"Value to that LP-level exit proceeds by the exit year."
-                    )
-                    sched_df = pd.DataFrame(d["schedule"])
-                    st.dataframe(
-                        sched_df.style.format({
-                            "revenue": "${:,.0f}", "ebitda": "${:,.0f}", "fcf": "${:,.0f}",
-                            "beginning_net_debt": "${:,.0f}", "ending_net_debt": "${:,.0f}",
-                        }),
-                        width="stretch", hide_index=True,
-                    )
-                    st.divider()
+        if fee_schedule_display is not None:
+            with st.expander("Two-tier management fee schedule"):
+                st.caption(
+                    f"Investment period (years 1-{crossover_year - 1}): {fee_rate_initial*100:.1f}% of "
+                    f"the LP's committed capital (${lp_commitment:,.0f}). From year {crossover_year} on: "
+                    f"{fee_rate_post*100:.1f}% of that year's remaining cost basis -- shrinking as "
+                    "companies exit."
+                )
+                st.dataframe(
+                    fee_schedule_display.style.format({"Fee rate": "{:.2%}", "Fee basis ($)": "${:,.0f}", "Fee ($)": "${:,.0f}"}),
+                    width="stretch", hide_index=True,
+                )
+        if asset_model_details:
+            with st.expander("What each asset model is feeding into this forecast"):
+                st.caption(
+                    "Summary only -- the full build for each company (Deal Snapshot through "
+                    "Cash Flow to Fund Model) lives in the **Asset Model (Bottom-up)** tab."
+                )
+                am_df = pd.DataFrame(asset_model_details)
+                st.dataframe(
+                    am_df.style.format({
+                        "gross_proceeds_to_fund": "${:,.0f}",
+                        "exit_proceeds_to_fund_lp": "${:,.0f}",
+                        "implied_return": "{:+.1%}",
+                        "gross_moic_vs_cost": "{:.2f}x",
+                        "gross_irr_annualised": "{:.1%}",
+                    }),
+                    width="stretch", hide_index=True,
+                )
 
     fdf = pd.DataFrame(forecast_rows)
 
@@ -609,10 +943,19 @@ with tab2:
             )
 
     if apply_fees:
-        st.caption(
-            f"Net of a {mgmt_fee*100:.1f}% annual management fee and {carry_rate*100:.0f}% "
-            f"carried interest above an {hurdle_rate*100:.1f}% preferred return."
-        )
+        if use_two_tier_fee:
+            fee_caption = (
+                f"Net of a two-tier management fee ({fee_rate_initial*100:.1f}% of commitment "
+                f"through year {crossover_year - 1}, then {fee_rate_post*100:.1f}% of remaining "
+                f"cost basis from year {crossover_year} on) and {carry_rate*100:.0f}% carried "
+                f"interest above an {hurdle_rate*100:.1f}% preferred return."
+            )
+        else:
+            fee_caption = (
+                f"Net of a {mgmt_fee*100:.1f}% annual management fee and {carry_rate*100:.0f}% "
+                f"carried interest above an {hurdle_rate*100:.1f}% preferred return."
+            )
+        st.caption(fee_caption)
         fmt = {
             "beginning_nav": "${:,.0f}",
             "grown_nav": "${:,.0f}",
@@ -748,7 +1091,14 @@ with tab3:
     )
     st.plotly_chart(fig3, width="stretch")
 
-with tab4:
+# --------------------------------------------------------------------------
+# Analytics & Pricing Bridge -- appended to the Overview tab (Streamlit lets a tab
+# container be written into more than once, so this lands under the metrics and
+# cash-flow chart already rendered in tab1 above). It sits here in the script
+# rather than up there because it needs the pricing scenarios computed in between.
+# --------------------------------------------------------------------------
+with tab1:
+    st.divider()
     st.subheader("Historical performance: Gross vs. Net")
     if gp_reported_gross_moic or gp_reported_gross_irr:
         gpc1, gpc2 = st.columns(2)

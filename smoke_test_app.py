@@ -32,20 +32,31 @@ run_and_check("default aggregate mode")
 print("\n--- Portfolio companies (detailed) mode, default expected-return ---")
 run_and_check("portfolio mode", lambda at: at.sidebar.radio[0].set_value("Portfolio companies (detailed)"))
 
-print("\n--- Portfolio mode + bottom-up EV/EBITDA valuation ---")
+print("\n--- Portfolio mode: asset models drive the forecast by default ---")
 
 
-def to_ebitda(at):
+def portfolio_asset_models(at):
     at.sidebar.radio[0].set_value("Portfolio companies (detailed)")
     at.run()
-    # radio[1] should now be the valuation-method radio
-    radios = [r for r in at.sidebar.radio]
-    valuation_radio = [r for r in radios if "EV/EBITDA" in str(r.options)]
-    assert valuation_radio, f"could not find valuation-method radio among {[r.options for r in radios]}"
-    valuation_radio[0].set_value("Bottom-up EV/EBITDA model (detailed)")
+    # Every company should have a "drives the forecast" toggle rendered in the Asset Model tab.
+    drives = [c for c in at.checkbox if "drive the fund forecast" in c.label]
+    assert len(drives) >= 5, f"expected one drives-forecast toggle per company, found {len(drives)}"
 
 
-run_and_check("portfolio + EV/EBITDA mode", to_ebitda)
+run_and_check("portfolio + asset models on", portfolio_asset_models)
+
+print("\n--- One asset model switched off (falls back to Expected Return %) ---")
+
+
+def one_asset_model_off(at):
+    at.sidebar.radio[0].set_value("Portfolio companies (detailed)")
+    at.run()
+    drives = [c for c in at.checkbox if "drive the fund forecast" in c.label]
+    assert drives, "no drives-forecast toggles found"
+    drives[0].set_value(False)
+
+
+run_and_check("one asset model off", one_asset_model_off)
 
 print("\n--- Unfunded commitment generates its own return ---")
 
@@ -123,17 +134,31 @@ def with_gross_reported(at):
 
 run_and_check("gross-reported MOIC/IRR shown in Analytics tab", with_gross_reported)
 
-print("\n--- Everything together: Fund/LP + EV/EBITDA + unfunded return + leverage + declining waterfall ---")
+print("\n--- Portfolio mode + two-tier (step-down) management fee ---")
+
+
+def to_two_tier_fee(at):
+    at.sidebar.radio[0].set_value("Portfolio companies (detailed)")
+    at.run()
+    radios = [r for r in at.sidebar.radio]
+    fee_radio = [r for r in radios if "step-down on remaining cost" in str(r.options)]
+    assert fee_radio, f"could not find fee-basis radio among {[r.options for r in radios]}"
+    fee_radio[0].set_value("Two-tier: flat on commitment, then step-down on remaining cost")
+
+
+run_and_check("portfolio + two-tier management fee", to_two_tier_fee)
+
+print("\n--- Everything together: Fund/LP + asset models + unfunded return + leverage + declining waterfall ---")
 
 
 def everything(at):
     at.sidebar.radio[0].set_value("Portfolio companies (detailed)")
     at.run()
     radios = [r for r in at.sidebar.radio]
-    valuation_radio = [r for r in radios if "EV/EBITDA" in str(r.options)][0]
-    valuation_radio.set_value("Bottom-up EV/EBITDA model (detailed)")
     wf = [r for r in radios if "hurdle balance" in str(r.options)][0]
     wf.set_value("Declining hurdle balance")
+    fee_radio = [r for r in radios if "step-down on remaining cost" in str(r.options)][0]
+    fee_radio.set_value("Two-tier: flat on commitment, then step-down on remaining cost")
     for c in at.sidebar.checkbox:
         if "generates its own return" in c.label:
             c.set_value(True)

@@ -8,7 +8,7 @@ Covers three things an LP secondaries desk actually needs:
 """
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +144,8 @@ def forecast_cashflows(nav_current: float, remaining_years: int, gross_return: f
 # meaningfully different growth rates and exit timing.
 # ---------------------------------------------------------------------------
 
-def forecast_from_portfolio(companies: List[Dict], mgmt_fee_rate: float, as_of: date) -> List[Dict]:
+def forecast_from_portfolio(companies: List[Dict], mgmt_fee_rate: float, as_of: date,
+                             fee_override_by_year: Optional[Dict[int, float]] = None) -> List[Dict]:
     """
     companies: list of dicts with keys:
       name, current_value (the value the forecast compounds from - typically a buyer's
@@ -162,7 +163,12 @@ def forecast_from_portfolio(companies: List[Dict], mgmt_fee_rate: float, as_of: 
 
     Management fee is charged fund-level each year on the aggregate value of
     companies not yet fully exited, deducted proportionally from each held
-    company's value.
+    company's value. By default that fee is a flat mgmt_fee_rate on the year's
+    grown NAV. Pass fee_override_by_year (e.g. from crossover_fee_schedule) to
+    substitute a specific dollar fee for a given forecast year instead -- used
+    for a two-tier fee (flat on commitment during the investment period, then a
+    step-down rate on remaining cost basis afterward). mgmt_fee_rate is ignored
+    for any year present in fee_override_by_year.
 
     Returns rows in the same shape as forecast_cashflows (plus an 'exits' list per
     row for transparency), so apply_carry_waterfall/secondary_pricing work unchanged.
@@ -184,8 +190,11 @@ def forecast_from_portfolio(companies: List[Dict], mgmt_fee_rate: float, as_of: 
             gv = values[i] * (1 + float(c["expected_return"]))
             grown_vals[i] = gv
             grown_total += gv
-        fee = grown_total * mgmt_fee_rate
-        fee_ratio = ((grown_total - fee) / grown_total) if grown_total > 0 else 0.0
+        if fee_override_by_year is not None and t in fee_override_by_year:
+            fee = fee_override_by_year[t]
+        else:
+            fee = grown_total * mgmt_fee_rate
+        fee_ratio = max(0.0, (grown_total - fee) / grown_total) if grown_total > 0 else 0.0
         distribution = 0.0
         exits_this_year = []
         for i, c in enumerate(companies):
@@ -225,6 +234,62 @@ def forecast_from_portfolio(companies: List[Dict], mgmt_fee_rate: float, as_of: 
             "exits": exits_this_year,
         })
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Two-tier ("step-down") management fee: flat on total commitment during the
+# investment period, then a (usually lower) rate on remaining invested cost
+# basis afterward -- mirrors a common real-world PE fee schedule where the fee
+# basis shrinks as portfolio companies are realized, rather than staying flat
+# on NAV or on committed capital for the whole fund life.
+# ---------------------------------------------------------------------------
+
+def remaining_cost_basis_by_year(companies: List[Dict], max_year: int) -> Dict[int, float]:
+    """
+    companies: list of dicts, each with 'cost' (original invested cost basis, $) plus the
+    same exit schedule keys as forecast_from_portfolio (exit_year_1, exit_pct_1, exit_year_2,
+    exit_pct_2). This does NOT need 'current_value' or 'expected_return' -- cost basis runs
+    off on its own timeline, independent of the value/return forecast.
+
+    For each forecast year t (1..max_year), returns the sum across companies of the cost
+    basis still "in" the fund business as of that year: a company's full original cost
+    counts through its exit year (inclusive) and drops out starting the year after, reduced
+    proportionally for a partial exit (exit_pct_1 in exit_year_1, exit_pct_2 of what remains
+    in exit_year_2) -- matching the fee treatment in the source model, where a company that
+    exits in year Y still sits in that year's fee basis and disappears from year Y+1 on.
+    """
+    remaining = {i: float(c.get("cost", 0.0)) for i, c in enumerate(companies)}
+    out = {}
+    for t in range(1, max_year + 1):
+        out[t] = sum(max(0.0, v) for v in remaining.values())
+        for i, c in enumerate(companies):
+            if int(c.get("exit_year_1", 0)) == t and float(c.get("exit_pct_1", 0)) > 0:
+                remaining[i] -= remaining[i] * float(c["exit_pct_1"])
+            if int(c.get("exit_year_2", 0)) == t and float(c.get("exit_pct_2", 0)) > 0:
+                remaining[i] -= remaining[i] * float(c["exit_pct_2"])
+    return out
+
+
+def crossover_fee_schedule(total_commitment: float, remaining_cost_by_year: Dict[int, float],
+                            crossover_year: int, fee_rate_initial: float,
+                            fee_rate_post: float) -> Dict[int, float]:
+    """
+    Builds the {year: fee_dollar_amount} schedule for a two-tier management fee:
+      - years before crossover_year: flat fee_rate_initial x total_commitment (the
+        investment-period fee, charged on the whole commitment regardless of how much
+        is actually deployed yet).
+      - crossover_year onward: fee_rate_post x that year's remaining cost basis (from
+        remaining_cost_basis_by_year) -- typically a lower rate, and shrinking basis, since
+        the fund is past its investment period and living off realizations.
+    Feed the result straight into forecast_from_portfolio(..., fee_override_by_year=...).
+    """
+    out = {}
+    for t, basis in remaining_cost_by_year.items():
+        if t < crossover_year:
+            out[t] = fee_rate_initial * total_commitment
+        else:
+            out[t] = fee_rate_post * basis
+    return out
 
 
 def ebitda_exit_value(entry_revenue: float, entry_ebitda_margin: float, entry_ev_multiple: float,
@@ -288,6 +353,154 @@ def ebitda_exit_value(entry_revenue: float, entry_ebitda_margin: float, entry_ev
         "exit_net_debt": exit_net_debt,
         "exit_equity_value": exit_equity_value,
         "exit_proceeds_to_fund": exit_proceeds_to_fund,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Full bottom-up asset model -- a direct port of the per-company tabs in the
+# source Excel model (Deal Snapshot / Entry Assumptions / Operating Projections
+# / Exit Valuation / Returns & Tie-Out / Cash Flow to Fund Model).
+#
+# Differs from ebitda_exit_value above in three ways that matter:
+#   1. growth, margin and FCF conversion are per-year VECTORS, not single rates,
+#      so a company can be modelled year by year rather than on one flat curve;
+#   2. net debt is NOT floored at zero -- a cash-generative company runs into a
+#      net cash position, which lifts exit equity value (the Excel does this, and
+#      two of its five assets actually end up net cash);
+#   3. years are calendar years and the exit is picked out by matching the exit
+#      year against the projection columns, mirroring the Excel's INDEX/MATCH.
+# All amounts are unit-agnostic -- feed it $mm and you get $mm back, which is how
+# the source model is denominated.
+# ---------------------------------------------------------------------------
+
+def asset_model_build(entry_revenue: float, entry_ebitda_margin: float, entry_ev_multiple: float,
+                       entry_net_debt_ebitda: float, fund_ownership_pct: float,
+                       years: List[int], revenue_growth: List[float], ebitda_margin: List[float],
+                       fcf_conversion: List[float], exit_year: int,
+                       exit_ev_multiple: float) -> Dict:
+    """
+    years: calendar years of the projection columns, ascending (e.g. [2026..2033]).
+    revenue_growth / ebitda_margin / fcf_conversion: one entry per year, same length.
+    exit_year: the calendar year the position is exited; every projection line is
+      zero from the year after it (matching the Excel's IF(year<=exit_year, ..., 0)).
+
+    Entry block: EBITDA = revenue x margin, EV = EBITDA x multiple, net debt =
+    EBITDA x net-debt multiple, equity = EV - net debt.
+    Each projection year: revenue grows off the PRIOR year (year one grows off
+    entry revenue, as the Excel does), EBITDA = revenue x that year's margin, FCF =
+    EBITDA x that year's conversion, and FCF pays down net debt dollar for dollar.
+    Exit: that year's EBITDA re-rated at exit_ev_multiple, less that year's ENDING
+    net debt, times fund ownership.
+
+    Returns the entry block, the full year-by-year schedule, the exit valuation, and
+    the single-row cash flow to the fund model.
+    """
+    n = len(years)
+    if not (len(revenue_growth) == len(ebitda_margin) == len(fcf_conversion) == n):
+        raise ValueError("years, revenue_growth, ebitda_margin and fcf_conversion must be the same length")
+
+    entry_ebitda = entry_revenue * entry_ebitda_margin
+    entry_enterprise_value = entry_ebitda * entry_ev_multiple
+    entry_net_debt = entry_ebitda * entry_net_debt_ebitda
+    entry_equity_value = entry_enterprise_value - entry_net_debt
+
+    schedule = []
+    prev_revenue = entry_revenue
+    prev_net_debt_ending = entry_net_debt
+    for i, y in enumerate(years):
+        active = y <= exit_year
+        revenue = prev_revenue * (1 + revenue_growth[i]) if active else 0.0
+        ebitda = revenue * ebitda_margin[i] if active else 0.0
+        fcf = ebitda * fcf_conversion[i] if active else 0.0
+        net_debt_beginning = entry_net_debt if i == 0 else prev_net_debt_ending
+        debt_paydown = fcf if active else 0.0
+        net_debt_ending = (net_debt_beginning - debt_paydown) if active else 0.0
+        schedule.append({
+            "year": y,
+            "revenue_growth": revenue_growth[i],
+            "revenue": revenue,
+            "ebitda_margin": ebitda_margin[i],
+            "ebitda": ebitda,
+            "fcf_conversion": fcf_conversion[i],
+            "fcf": fcf,
+            "net_debt_beginning": net_debt_beginning,
+            "debt_paydown": debt_paydown,
+            "net_debt_ending": net_debt_ending,
+        })
+        prev_revenue = revenue
+        prev_net_debt_ending = net_debt_ending
+
+    exit_row = next((r for r in schedule if r["year"] == exit_year), None)
+    if exit_row is None:
+        # Exit year falls outside the projection columns -- the Excel would show #N/A
+        # here; report it rather than silently valuing the position at zero.
+        return {
+            "entry_ebitda": entry_ebitda,
+            "entry_enterprise_value": entry_enterprise_value,
+            "entry_net_debt": entry_net_debt,
+            "entry_equity_value": entry_equity_value,
+            "schedule": schedule,
+            "exit_year_in_horizon": False,
+            "exit_ebitda": None,
+            "exit_enterprise_value": None,
+            "net_debt_at_exit": None,
+            "exit_equity_value": None,
+            "fund_ownership_pct": fund_ownership_pct,
+            "gross_proceeds_to_fund": 0.0,
+            "cash_flow_to_fund": [{"year": y, "exit_proceeds_to_fund": 0.0} for y in years],
+        }
+
+    exit_ebitda = exit_row["ebitda"]
+    exit_enterprise_value = exit_ebitda * exit_ev_multiple
+    net_debt_at_exit = exit_row["net_debt_ending"]
+    exit_equity_value = exit_enterprise_value - net_debt_at_exit
+    gross_proceeds_to_fund = exit_equity_value * fund_ownership_pct
+
+    return {
+        "entry_ebitda": entry_ebitda,
+        "entry_enterprise_value": entry_enterprise_value,
+        "entry_net_debt": entry_net_debt,
+        "entry_equity_value": entry_equity_value,
+        "schedule": schedule,
+        "exit_year_in_horizon": True,
+        "exit_ebitda": exit_ebitda,
+        "exit_enterprise_value": exit_enterprise_value,
+        "net_debt_at_exit": net_debt_at_exit,
+        "exit_equity_value": exit_equity_value,
+        "fund_ownership_pct": fund_ownership_pct,
+        "gross_proceeds_to_fund": gross_proceeds_to_fund,
+        "cash_flow_to_fund": [
+            {"year": y, "exit_proceeds_to_fund": gross_proceeds_to_fund if y == exit_year else 0.0}
+            for y in years
+        ],
+    }
+
+
+def asset_model_returns(gross_proceeds_to_fund: float, lp_cost: float, reported_value: float,
+                         hold_years: int, prior_proceeds: Optional[float] = None) -> Dict:
+    """
+    The 'Returns & Tie-Out' block of the source model: gross MOIC against original
+    cost, the multiple against the GP's current reported mark, an annualized gross
+    IRR from cost to exit proceeds over the hold period, and the variance against a
+    previously circulated fund-model figure (the Excel keeps that as a hardcode so a
+    re-run can be diffed against what was last shown to the client).
+
+    Any ratio whose denominator is zero comes back as None rather than raising -- the
+    Excel shows "NM" in exactly those cases.
+    """
+    gross_moic = (gross_proceeds_to_fund / lp_cost) if lp_cost > 0 else None
+    multiple_on_rv = (gross_proceeds_to_fund / reported_value) if reported_value > 0 else None
+    if lp_cost > 0 and hold_years > 0 and gross_proceeds_to_fund > 0:
+        gross_irr = (gross_proceeds_to_fund / lp_cost) ** (1.0 / hold_years) - 1.0
+    else:
+        gross_irr = None
+    variance = (gross_proceeds_to_fund - prior_proceeds) if prior_proceeds is not None else None
+    return {
+        "gross_moic_vs_cost": gross_moic,
+        "multiple_on_rv": multiple_on_rv,
+        "gross_irr_annualised": gross_irr,
+        "prior_proceeds": prior_proceeds,
+        "variance_vs_prior": variance,
     }
 
 

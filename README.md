@@ -22,18 +22,39 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
 6. **Unfunded commitment generates its own return** (optional) — a future capital call isn't
    just an outflow; it funds a new investment that itself returns money. Turn this on to
    project a return (hold period + MOIC) on every future call.
-7. **Bottom-up EV/EBITDA company model** (optional, Portfolio companies mode) — instead of a
-   flat "Expected Return %" per company, build each company's own Revenue -> EBITDA -> FCF ->
-   Exit EV/EBITDA model; the app backs out the equivalent annualized return from it.
+7. **Asset Model (Bottom-up)** — its own tab, with one full company model per holding, laid out
+   like a real per-asset tab: Deal Snapshot, Entry Assumptions, Operating Projections ($mm, with
+   per-year revenue growth / EBITDA margin / FCF conversion), Exit Valuation, Returns & Tie-Out,
+   and Cash Flow to Fund Model. Add or remove companies by adding rows to the portfolio table;
+   a model appears for each one. Each model backs out the annualized return that drives that
+   company in the fund forecast, and can be switched off per company to fall back to a flat
+   Expected Return %.
 8. **Leverage overlay** (optional) — model the buyer financing part of the purchase price with
    a subscription-line/NAV facility, shown alongside (never in place of) the unlevered return.
+9. **Declining-balance waterfall + Analytics & Pricing Bridge** (optional) — an alternate,
+   equally valid European waterfall mechanic (a running hurdle balance that accrues and shrinks,
+   vs. the default compounded-threshold test), plus an analytics block (in the Overview tab)
+   covering Gross-vs-Net performance, MV CAGR, cash-flow duration, RV/MV multiple, and MOIC
+   adjusted vs. unadjusted for interim cash flows.
+10. **Two-tier ("step-down") management fee** (optional, Portfolio companies mode) — mirrors a
+    common real fund schedule: a flat rate on the fund's total commitment during the investment
+    period, then from a chosen crossover year onward, a (usually lower) rate on each company's
+    remaining invested cost basis, which shrinks as companies exit. The default flat fee-on-NAV
+    stays available and is still the default.
 
 ## Files
 
-- `app.py` — Streamlit UI (4 tabs: Overview, Cash Flow Forecast, Secondary Pricing, AI Assistant)
-- `finance_engine.py` — core calculations (XIRR, runoff model, pricing sensitivity)
+- `app.py` — Streamlit UI (5 tabs: Overview *(incl. Analytics & Pricing Bridge)*, Cash Flow
+  Forecast, Secondary Pricing, Asset Model (Bottom-up), AI Assistant)
+- `finance_engine.py` — core calculations (XIRR, runoff model, pricing sensitivity, waterfalls,
+  bottom-up asset model, two-tier management fee)
 - `ai_agent.py` — AI agent wrapper (Claude + fallback)
 - `sample_fund_cashflows.csv` — sample fund history so the app runs out of the box
+
+The app's defaults are a real secondary: a 2022-vintage $1,014.7mm fund, a $33.5mm selling LP
+(3.30%), five current investments at $426.4mm cost / $657.3mm reported value, and the asset
+models reproduce that deal's per-company builds line for line (`test_v5_asset_model.py` pins
+them to the source workbook's own computed values).
 
 ## Run it
 
@@ -57,8 +78,14 @@ Suggested flow for a demo:
    assumptions sliders live to show sensitivity.
 3. **Secondary Pricing tab** — the core pitch: show the IRR/MOIC a buyer gets at different
    discounts to NAV, so a price can be defended with numbers, not gut feel.
-4. **AI Assistant tab** — ask it a live question in front of the room to show it reasons over
+4. **Asset Model tab** — drill into any single company: its operating build, exit valuation, and
+   the tie-out back to what the fund model previously showed. This is where a sceptical buyer's
+   "where does that number come from?" gets answered.
+5. **AI Assistant tab** — ask it a live question in front of the room to show it reasons over
    the actual model output rather than giving generic answers.
+
+The Overview tab also carries the Gross-vs-Net bridge and timing analytics, so the headline
+story and the "why" sit on one screen.
 
 Key assumptions to be upfront about: the gross return and runoff shape are analyst inputs, not
 predictions — frame the tool as a transparent, adjustable pricing calculator plus an AI layer
