@@ -232,9 +232,12 @@ at = _portfolio_app()
 tables = {}
 for d in at.dataframe:
     cols = list(d.value.columns)
-    if "Company Name" in cols:
-        kind = "fund" if "% of RV" in cols else "lp"
-        tables.setdefault(kind, []).append(d.value)
+    # The editable input grids also carry "Company Name"; the computed tables are the
+    # ones with the derived columns, so key off those rather than the name column.
+    if "% of RV" in cols:
+        tables.setdefault("fund", []).append(d.value)
+    elif "LP Cost" in cols:
+        tables.setdefault("lp", []).append(d.value)
 
 _check("both a fund-level and an LP-level table render",
        len(tables.get("fund", [])) >= 2 and len(tables.get("lp", [])) >= 2,
@@ -279,6 +282,68 @@ if len(tables.get("fund", [])) >= 2:
            float(f_row["2026"]) == -90.0, f_row["2026"])
     _check("post-report proceeds land at the assumed MOIC (90 x 1.75)",
            abs(float(f_row["Proceeds"]) - 157.5) < 1e-6, f_row["Proceeds"])
+
+print("\n--- Investments grids: editable, dynamic rows, fund/LP row counts locked together ---")
+
+
+def _company_tables(at):
+    """The four computed tables (current fund/LP, post-report fund/LP), in render order --
+    the editable input grids are excluded, so a count here is a company count."""
+    return [d.value for d in at.dataframe
+            if "% of RV" in list(d.value.columns) or "LP Cost" in list(d.value.columns)]
+
+
+def _counts(at):
+    """(fund rows, lp rows) for each block, Total row included."""
+    return [len(t) for t in _company_tables(at)]
+
+
+# A data_editor's edits live in session_state as a delta dict, which is how a real
+# user's keystroke reaches the script -- so driving it this way exercises the same path.
+at = _portfolio_app()
+at.session_state["inv_current_editor"] = {
+    "edited_rows": {0: {"RV": 250.0}}, "added_rows": [], "deleted_rows": []}
+at.run()
+_check("editing RV in the Investments grid updates fund NAV",
+       _metric(at, "Aggregate Reported Value") == "$719,300,000",
+       _metric(at, "Aggregate Reported Value"))
+_check("that edit also reaches the Deal Snapshot widget (one shared store)",
+       at.session_state["am_A_rv"] == 250.0, at.session_state["am_A_rv"])
+
+at = _portfolio_app()
+at.session_state["inv_current_editor"] = {
+    "edited_rows": {},
+    "added_rows": [{"Company Name": "Asset G", "Cost": 50.0, "RV": 60.0,
+                    "MV Adjustment (%)": 0.0, "Exit Year": 2030}],
+    "deleted_rows": []}
+at.run()
+counts = _counts(at)
+_check("adding a row in the grid adds a company everywhere",
+       _metric(at, "Companies") == "6" and counts[0] == counts[1] == 7,
+       f"companies={_metric(at, 'Companies')} table rows={counts}")
+_check("the added company's RV lands in fund NAV",
+       _metric(at, "Aggregate Reported Value") == "$717,300,000",
+       _metric(at, "Aggregate Reported Value"))
+
+at = _portfolio_app()
+at.session_state["inv_current_editor"] = {
+    "edited_rows": {}, "added_rows": [], "deleted_rows": [1]}
+at.run()
+counts = _counts(at)
+_check("deleting a row removes that company everywhere",
+       _metric(at, "Companies") == "4" and counts[0] == counts[1] == 5,
+       f"companies={_metric(at, 'Companies')} table rows={counts}")
+
+at = _portfolio_app()
+at.session_state["followons_editor"] = {
+    "edited_rows": {},
+    "added_rows": [{"Name": "Asset H", "Amount ($M)": 40.0, "Year": 2}],
+    "deleted_rows": []}
+at.run()
+counts = _counts(at)
+_check("adding a post-report investment shows up in both its views",
+       counts[2] == counts[3] == 3, f"post-report table rows={counts[2:]}")
+_check("no exceptions across any of the grid edits", not at.exception, at.exception)
 
 print("\n=== SUMMARY ===")
 if FAILS:
