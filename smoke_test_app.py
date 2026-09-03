@@ -210,13 +210,40 @@ _check("editing a company's Exit Year extends the forecast horizon",
        _metric(at, "Forecast horizon").startswith("10 yrs"), _metric(at, "Forecast horizon"))
 
 at = _portfolio_app()
-[b for b in at.button if "Add a company" in b.label][0].click()
+[b for b in at.button if "Add 1 company" in b.label][0].click()
 at.run()
 added = _metric(at, "Companies")
 [b for b in at.button if b.label == "Remove"][0].click()
 at.run()
 _check("add / remove a company", added == "6" and _metric(at, "Companies") == "5",
        f"after add={added}, after remove={_metric(at, 'Companies')}")
+
+# The point of the count box: N rows in one click, not N clicks.
+at = _portfolio_app()
+[n for n in at.number_input if n.label == "Rows to add"][0].set_value(3)
+at.run()
+bulk = [b for b in at.button if "Add 3 companies" in b.label]
+_check("the Add button pluralises and offers the chosen count", bool(bulk),
+       [b.label for b in at.button][:6])
+if bulk:
+    bulk[0].click()
+    at.run()
+    _check("adding 3 companies in one click", _metric(at, "Companies") == "8",
+           _metric(at, "Companies"))
+
+at = _portfolio_app()
+ns = [n for n in at.number_input if n.label == "Rows to add"]
+_check("both blocks have their own count box", len(ns) >= 2, len(ns))
+if len(ns) >= 2:
+    ns[1].set_value(2)
+    at.run()
+    bp = [b for b in at.button if "Add 2 investments" in b.label]
+    if bp:
+        bp[0].click()
+        at.run()
+    _check("adding 2 post-report investments in one click",
+           len(at.session_state["followon_rows"]) == 3,
+           len(at.session_state["followon_rows"]))
 
 at = _portfolio_app()
 moic_before = _metric(at, "Gross MOIC (vs Cost)")
@@ -228,74 +255,72 @@ _check("renaming a company keeps its model intact (stable widget ids)",
 
 print("\n--- Investments tab: column order and fund/LP tie-out ---")
 
+
+def _inv_tables(at):
+    """The Investments tab's five tables, in render order:
+    0 current fund grid, 1 current total, 2 current LP, 3 post-report grid, 4 post-report LP."""
+    return [d.value for d in at.dataframe if "Company Name" in list(d.value.columns)]
+
+
 at = _portfolio_app()
-tables = {}
-for d in at.dataframe:
-    cols = list(d.value.columns)
-    # The editable input grids also carry "Company Name"; the computed tables are the
-    # ones with the derived columns, so key off those rather than the name column.
-    if "% of RV" in cols:
-        tables.setdefault("fund", []).append(d.value)
-    elif "LP Cost" in cols:
-        tables.setdefault("lp", []).append(d.value)
+t = _inv_tables(at)
+_check("all five Investments tables render", len(t) == 5, len(t))
 
-_check("both a fund-level and an LP-level table render",
-       len(tables.get("fund", [])) >= 2 and len(tables.get("lp", [])) >= 2,
-       f"fund={len(tables.get('fund', []))} lp={len(tables.get('lp', []))}")
+if len(t) == 5:
+    grid, total, lp, post_grid, post_lp = t
 
-if tables.get("fund"):
-    cur_fund = tables["fund"][0]
-    head = list(cur_fund.columns)[:8]
-    _check("fund columns follow the workbook's order",
+    head = [c for c in list(grid.columns) if c != "id"][:8]
+    _check("the editable grid follows the workbook's column order",
            head == ["Company Name", "Inv. Date", "% of RV", "% of MV", "Cost", "RV",
-                    "MV Adjustment", "MV"], head)
-    _check("last fund column is Proceeds", list(cur_fund.columns)[-1] == "Proceeds",
-           list(cur_fund.columns)[-1])
-    total = cur_fund[cur_fund["Company Name"] == "Total"].iloc[0]
+                    "MV Adjustment (%)", "MV"], head)
+    _check("the grid's last column is Proceeds", list(grid.columns)[-1] == "Proceeds",
+           list(grid.columns)[-1])
+    _check("inputs and computed columns live in ONE table (no separate input grid)",
+           "Cost" in grid.columns and "Proceeds" in grid.columns and len(t) == 5)
+    _check("the grid carries a row id, so deleting a row can't reassign another model",
+           "id" in grid.columns, list(grid.columns)[:2])
+
     _check("Current Investments total cost ties to the deal ($426.4mm)",
-           abs(float(total["Cost"]) - 426.4) < 0.05, total["Cost"])
+           abs(float(total.iloc[0]["Cost"]) - 426.4) < 0.05, total.iloc[0]["Cost"])
     _check("Current Investments total RV ties to fund NAV ($657.3mm)",
-           abs(float(total["RV"]) - 657.3) < 0.05, total["RV"])
-    _check("% of RV sums to 100%", abs(float(total["% of RV"]) - 1.0) < 1e-9, total["% of RV"])
-    a_row = cur_fund[cur_fund["Company Name"] == "Asset A"].iloc[0]
+           abs(float(total.iloc[0]["RV"]) - 657.3) < 0.05, total.iloc[0]["RV"])
+
+    a_row = grid[grid["Company Name"] == "Asset A"].iloc[0]
+    _check("Asset A % of RV matches the workbook (28.6019%)",
+           abs(float(a_row["% of RV"]) - 0.286018560778944) < 1e-9, a_row["% of RV"])
     _check("Asset A proceeds match its asset model (238.106358)",
            abs(float(a_row["Proceeds"]) - 238.106358) < 1e-5, a_row["Proceeds"])
 
-if tables.get("lp"):
-    cur_lp = tables["lp"][0]
-    head = list(cur_lp.columns)[:5]
+    head_lp = list(lp.columns)[:5]
     _check("LP columns follow the workbook's order",
-           head == ["Company Name", "Inv. Date", "LP Cost", "LP RV", "LP MV"], head)
+           head_lp == ["Company Name", "Inv. Date", "LP Cost", "LP RV", "LP MV"], head_lp)
     _check("last LP columns are Proceeds then MOIC",
-           list(cur_lp.columns)[-2:] == ["LP Proceeds", "LP MOIC"], list(cur_lp.columns)[-2:])
-    a_lp = cur_lp[cur_lp["Company Name"] == "Asset A"].iloc[0]
+           list(lp.columns)[-2:] == ["LP Proceeds", "LP MOIC"], list(lp.columns)[-2:])
+    a_lp = lp[lp["Company Name"] == "Asset A"].iloc[0]
     _check("LP MOIC is scale-invariant (matches the fund's 3.0923x)",
            abs(float(a_lp["LP MOIC"]) - 3.09229036363636) < 1e-6, a_lp["LP MOIC"])
     _check("LP RV total is the LP's share of fund NAV",
-           abs(float(cur_lp[cur_lp["Company Name"] == "Total"].iloc[0]["LP RV"]) - 21.700552) < 1e-3,
-           cur_lp[cur_lp["Company Name"] == "Total"].iloc[0]["LP RV"])
+           abs(float(lp[lp["Company Name"] == "Total"].iloc[0]["LP RV"]) - 21.700552) < 1e-3,
+           lp[lp["Company Name"] == "Total"].iloc[0]["LP RV"])
+    _check("fund and LP list the same companies",
+           len(grid) == len(lp) - 1, f"grid={len(grid)} lp={len(lp)} (LP carries a Total row)")
 
-if len(tables.get("fund", [])) >= 2:
-    post = tables["fund"][1]
-    f_row = post.iloc[0]
+    f_row = post_grid.iloc[0]
     _check("post-report investment shows its draw as an outflow in the call year",
            float(f_row["2026"]) == -90.0, f_row["2026"])
     _check("post-report proceeds land at the assumed MOIC (90 x 1.75)",
            abs(float(f_row["Proceeds"]) - 157.5) < 1e-6, f_row["Proceeds"])
+    _check("post-report fund and LP list the same investments",
+           len(post_grid) == len(post_lp) - 1,
+           f"fund={len(post_grid)} lp={len(post_lp)} (LP carries a Total row)")
+
 
 print("\n--- Investments grids: editable, dynamic rows, fund/LP row counts locked together ---")
 
 
-def _company_tables(at):
-    """The four computed tables (current fund/LP, post-report fund/LP), in render order --
-    the editable input grids are excluded, so a count here is a company count."""
-    return [d.value for d in at.dataframe
-            if "% of RV" in list(d.value.columns) or "LP Cost" in list(d.value.columns)]
-
-
 def _counts(at):
-    """(fund rows, lp rows) for each block, Total row included."""
-    return [len(t) for t in _company_tables(at)]
+    """Row counts of the five Investments tables, in render order."""
+    return [len(t) for t in _inv_tables(at)]
 
 
 # A data_editor's edits live in session_state as a delta dict, which is how a real
@@ -319,7 +344,7 @@ at.session_state["inv_current_editor"] = {
 at.run()
 counts = _counts(at)
 _check("adding a row in the grid adds a company everywhere",
-       _metric(at, "Companies") == "6" and counts[0] == counts[1] == 7,
+       _metric(at, "Companies") == "6" and counts[0] == 6 and counts[2] == 7,
        f"companies={_metric(at, 'Companies')} table rows={counts}")
 _check("the added company's RV lands in fund NAV",
        _metric(at, "Aggregate Reported Value") == "$717,300,000",
@@ -331,18 +356,18 @@ at.session_state["inv_current_editor"] = {
 at.run()
 counts = _counts(at)
 _check("deleting a row removes that company everywhere",
-       _metric(at, "Companies") == "4" and counts[0] == counts[1] == 5,
+       _metric(at, "Companies") == "4" and counts[0] == 4 and counts[2] == 5,
        f"companies={_metric(at, 'Companies')} table rows={counts}")
 
 at = _portfolio_app()
 at.session_state["followons_editor"] = {
     "edited_rows": {},
-    "added_rows": [{"Name": "Asset H", "Amount ($M)": 40.0, "Year": 2}],
+    "added_rows": [{"Company Name": "Asset H", "Cost": 40.0, "Year": 2}],
     "deleted_rows": []}
 at.run()
 counts = _counts(at)
 _check("adding a post-report investment shows up in both its views",
-       counts[2] == counts[3] == 3, f"post-report table rows={counts[2:]}")
+       counts[3] == 2 and counts[4] == 3, f"post-report table rows={counts[3:]}")
 _check("no exceptions across any of the grid edits", not at.exception, at.exception)
 
 print("\n=== SUMMARY ===")

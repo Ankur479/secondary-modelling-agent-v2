@@ -185,7 +185,22 @@ if forecast_mode == "Portfolio companies (detailed)":
 def _asset_default(aid, field):
     """Default for one field of one asset: the deal's own value if it's one of the five
     originals, otherwise a generic starting point for a company the user just added."""
-    if aid in ASSET_DEFAULTS:
+    # Assumptions that start the same for every company, whether it came with the deal
+    # or was added just now.
+    shared = {
+        "entry_margin": COMMON_DEFAULTS["entry_ebitda_margin"],
+        "entry_ev": COMMON_DEFAULTS["entry_ev_multiple"],
+        "entry_nd": COMMON_DEFAULTS["entry_net_debt_ebitda"],
+        "ownership": COMMON_DEFAULTS["fund_ownership"],
+        "exit_ev": COMMON_DEFAULTS["exit_ev_multiple"],
+        "exit_pct_1": 100.0, "exit_pct_2": 0.0, "drives": True,
+    }
+    if field in shared:
+        return shared[field]
+    if field == "exit_cal_2":
+        # The optional second exit defaults to the first, i.e. no phasing.
+        return int(_asset_state(aid, "exit_cal"))
+    if aid in ASSET_DEFAULTS and field in ASSET_DEFAULTS[aid]:
         return ASSET_DEFAULTS[aid][field]
     generic = {
         "name": f"New Asset {aid}", "inv_date": as_of, "cost": 0.0, "rv": 10.0,
@@ -207,25 +222,146 @@ def _asset_state(aid, field):
     return st.session_state.get(f"am_{aid}_{field}", _asset_default(aid, field))
 
 
-SNAPSHOT_FIELDS = ("name", "inv_date", "cost", "rv", "mv_adj", "exit_cal",
-                   "expected_return", "prior_proceeds", "entry_revenue")
+# Every per-asset field lives in session_state under "am_<id>_<field>". Seeding them all
+# up front means the widgets further down can be keyed-only (no value= argument), the
+# editable grids can write to them, and -- crucially -- the asset models can be BUILT
+# before any widget renders, which is what lets one grid show inputs and computed columns
+# side by side.
+PER_ASSET_FIELDS = ("name", "inv_date", "cost", "rv", "mv_adj", "exit_cal", "expected_return",
+                    "prior_proceeds", "entry_revenue", "entry_margin", "entry_ev", "entry_nd",
+                    "ownership", "exit_ev", "exit_pct_1", "exit_cal_2", "exit_pct_2", "drives")
+
 if forecast_mode == "Portfolio companies (detailed)":
     for _aid in st.session_state["asset_ids"]:
-        for _f in SNAPSHOT_FIELDS:
+        for _f in PER_ASSET_FIELDS:
             st.session_state.setdefault(f"am_{_aid}_{_f}", _asset_default(_aid, _f))
 
 
-# --------------------------------------------------------------------------
-# Investments tab, part 1 of 2: the editable input grids
-# --------------------------------------------------------------------------
-# These render BEFORE the per-asset widgets below, and that ordering is load-bearing:
-# an edit here is written straight into the same session_state keys the Deal Snapshot
-# widgets use, and Streamlit only allows writing a widget's key before that widget is
-# instantiated on this run. So the two views can never drift -- edit a company's cost
-# in either place and both show it immediately. The computed tables (year columns,
-# proceeds, LP view) are appended into these same expanders further down, once the
-# asset models and the fund forecast have run.
+# Unfunded assumptions are read up here (to price post-report investments) but their widgets
+# live in the sidebar further down, so they are seeded the same way. These are seeded in
+# BOTH forecast modes -- a keyed checkbox that first renders unseeded would latch on to
+# False and stay there when the mode is switched.
+st.session_state.setdefault("unfunded_generates_return", True)
+st.session_state.setdefault("unfunded_hold_years", 4)
+st.session_state.setdefault("unfunded_moic", 1.75)
+st.session_state.setdefault("followon_rows", [
+    # The source model's post-report-date investment: a new company committed after the
+    # reporting date, funded in the first forecast year.
+    {"Name": "Asset F (post-report)", "Cost": 90.0, "Year": 1},
+])
+
+def _ops_vectors(aid, years):
+    """Per-year revenue growth / EBITDA margin / FCF conversion for one asset, as fractions.
+
+    Held in a plain (non-widget) session_state store so the model can be built before the
+    per-year grid renders; that grid writes back into this store when edited. The store is
+    stretched or trimmed whenever the forecast horizon changes, carrying the last year's
+    assumption forward rather than snapping back to the default.
+    """
+    key = f"am_{aid}_ops_store"
+    store = st.session_state.get(key)
+    if not isinstance(store, dict):
+        store = {}
+    out = {}
+    for field, default in (("growth", COMMON_DEFAULTS["revenue_growth"]),
+                           ("margin", COMMON_DEFAULTS["ebitda_margin"]),
+                           ("conv", COMMON_DEFAULTS["fcf_conversion"])):
+        vals = list(store.get(field, []))
+        while len(vals) < len(years):
+            vals.append(vals[-1] if vals else default)
+        out[field] = vals[:len(years)]
+    st.session_state[key] = out
+    return out
+
+
+asset_builds = {}      # company name -> {"build", "returns", "drives_forecast", ...}
+portfolio_rows = []    # the portfolio table the fund-level forecast consumes
+precomputed = {}       # asset id -> everything the Asset Model tab needs to render
 inv_expanders = {}
+
+if forecast_mode == "Portfolio companies (detailed)":
+    asset_ids = st.session_state["asset_ids"]
+    # Fund-level totals have to be known before anything renders: % of Fund RV needs the
+    # total, and the projection grid needs the longest hold.
+    total_rv = sum(float(_asset_state(aid, "rv")) for aid in asset_ids) if asset_ids else 0.0
+    nav_current = total_rv * 1_000_000
+    total_mv = sum(float(_asset_state(aid, "rv")) * (1 + float(_asset_state(aid, "mv_adj")) / 100)
+                   for aid in asset_ids) if asset_ids else 0.0
+    exit_rels = [max(1, int(_asset_state(aid, "exit_cal")) - as_of.year) for aid in asset_ids]
+    remaining_years = max(exit_rels) if exit_rels else 1
+    proj_years = [as_of.year + t for t in range(1, max(1, remaining_years) + 1)]
+    year_cols = [str(y) for y in proj_years]
+
+    for aid in asset_ids:
+        ops = _ops_vectors(aid, proj_years)
+        exit_cal = max(as_of.year + 1, int(_asset_state(aid, "exit_cal")))
+        rv_m = float(_asset_state(aid, "rv"))
+        cost_m = float(_asset_state(aid, "cost"))
+        adj_pct = float(_asset_state(aid, "mv_adj"))
+        mv_m = rv_m * (1 + adj_pct / 100)
+        inv_date = _asset_state(aid, "inv_date")
+        inv_year = inv_date.year if isinstance(inv_date, date) else as_of.year
+        hold_years = max(0, exit_cal - inv_year)
+        name = str(_asset_state(aid, "name"))
+
+        build = asset_model_build(
+            entry_revenue=float(_asset_state(aid, "entry_revenue")),
+            entry_ebitda_margin=float(_asset_state(aid, "entry_margin")) / 100,
+            entry_ev_multiple=float(_asset_state(aid, "entry_ev")),
+            entry_net_debt_ebitda=float(_asset_state(aid, "entry_nd")),
+            fund_ownership_pct=float(_asset_state(aid, "ownership")) / 100,
+            years=proj_years,
+            revenue_growth=[v / 100 for v in ops["growth"]],
+            ebitda_margin=[v / 100 for v in ops["margin"]],
+            fcf_conversion=[v / 100 for v in ops["conv"]],
+            exit_year=exit_cal,
+            exit_ev_multiple=float(_asset_state(aid, "exit_ev")),
+        )
+        prior = float(_asset_state(aid, "prior_proceeds"))
+        rets = asset_model_returns(build["gross_proceeds_to_fund"], cost_m, rv_m, hold_years,
+                                   prior if prior != 0 else None)
+
+        precomputed[aid] = {
+            "name": name, "build": build, "returns": rets, "ops": ops,
+            "cost_m": cost_m, "rv_m": rv_m, "adj_pct": adj_pct, "mv_m": mv_m,
+            "inv_date": inv_date, "exit_cal": exit_cal, "hold_years": hold_years,
+            "exit_rel": max(1, exit_cal - as_of.year),
+        }
+        asset_builds[name] = {
+            "build": build, "returns": rets,
+            "drives_forecast": bool(_asset_state(aid, "drives")),
+            "exit_cal_year": exit_cal, "hold_years": hold_years, "cost_m": cost_m, "rv_m": rv_m,
+        }
+        portfolio_rows.append({
+            "Company": name,
+            "Investment Date": inv_date,
+            "Cost Basis ($M)": cost_m,
+            "Reported Value ($M)": rv_m,
+            "MV Adjustment (%)": adj_pct,
+            "Expected Return (%)": float(_asset_state(aid, "expected_return")),
+            "Exit Year 1": max(1, exit_cal - as_of.year),
+            "Exit % 1": float(_asset_state(aid, "exit_pct_1")),
+            "Exit Year 2": max(1, int(_asset_state(aid, "exit_cal_2")) - as_of.year),
+            "Exit % 2": float(_asset_state(aid, "exit_pct_2")),
+        })
+
+
+# --------------------------------------------------------------------------
+# Investments tab -- one editable schedule per block, fund and LP views
+# --------------------------------------------------------------------------
+# This renders BEFORE the per-asset widgets below, and that ordering is load-bearing: an
+# edit here is written straight into the same session_state keys those widgets use, and
+# Streamlit only allows writing a widget's key before that widget is instantiated on this
+# run. So the two views can never drift. Because the models were built above, the same
+# grid can carry editable inputs and computed columns -- there is no separate input table.
+
+def _rows_to_add(singular, plural, key):
+    """A count box next to an Add button, so N rows arrive in one click instead of N clicks."""
+    c1, c2 = st.columns([1, 3])
+    n = int(c1.number_input("Rows to add", min_value=1, max_value=50, value=1, step=1,
+                            key=f"{key}_n", label_visibility="collapsed"))
+    return n, c2.button(f"➕ Add {n} {singular if n == 1 else plural}", key=f"{key}_btn")
+
 
 with tab3:
     st.subheader("Investments")
@@ -237,105 +373,277 @@ with tab3:
     else:
         st.caption(
             f"All figures in $mm. Fund level is the whole fund; LP level is the selling LP's "
-            f"{lp_pct*100:.2f}% share of the same schedule -- so both always list the same "
-            "companies. Add or delete rows in the Fund level grids below; the LP view follows."
+            f"{lp_pct*100:.2f}% share of the same schedule -- both always list the same "
+            "companies. White columns are editable; the shaded ones are computed."
         )
+
+        # ---------------- Current Investments ----------------
         st.markdown("### Current Investments")
         inv_expanders["cur_fund"] = st.expander("Fund level", expanded=True)
         inv_expanders["cur_lp"] = st.expander("LP level", expanded=False)
+
+        with inv_expanders["cur_fund"]:
+            n_add, add_clicked = _rows_to_add("company", "companies", "cur_add")
+            if add_clicked:
+                for _ in range(n_add):
+                    st.session_state["asset_seq"] += 1
+                    st.session_state["asset_ids"].append(f"N{st.session_state['asset_seq']}")
+                st.rerun()
+
+            cur_grid = pd.DataFrame([
+                {
+                    "id": aid,
+                    "Company Name": precomputed[aid]["name"],
+                    "Inv. Date": pd.to_datetime(precomputed[aid]["inv_date"]),
+                    "% of RV": (precomputed[aid]["rv_m"] / total_rv) if total_rv else 0.0,
+                    "% of MV": (precomputed[aid]["mv_m"] / total_mv) if total_mv else 0.0,
+                    "Cost": precomputed[aid]["cost_m"],
+                    "RV": precomputed[aid]["rv_m"],
+                    "MV Adjustment (%)": precomputed[aid]["adj_pct"],
+                    "MV": precomputed[aid]["mv_m"],
+                    "Exit Year": precomputed[aid]["exit_cal"],
+                    **{str(r["year"]): r["exit_proceeds_to_fund"]
+                       for r in precomputed[aid]["build"]["cash_flow_to_fund"]},
+                    "Proceeds": precomputed[aid]["build"]["gross_proceeds_to_fund"],
+                }
+                for aid in asset_ids
+            ], columns=(["id", "Company Name", "Inv. Date", "% of RV", "% of MV", "Cost", "RV",
+                         "MV Adjustment (%)", "MV", "Exit Year"] + year_cols + ["Proceeds"]))
+
+            computed_cols = ["% of RV", "% of MV", "MV", "Proceeds"] + year_cols
+            edited_cur = st.data_editor(
+                cur_grid, num_rows="dynamic", width="stretch", hide_index=True,
+                key="inv_current_editor",
+                disabled=computed_cols,
+                column_order=[c for c in cur_grid.columns if c != "id"],
+                column_config={
+                    "Inv. Date": st.column_config.DateColumn("Inv. Date", format="YYYY-MM-DD"),
+                    "% of RV": st.column_config.NumberColumn("% of RV", format="%.2f%%"),
+                    "% of MV": st.column_config.NumberColumn("% of MV", format="%.2f%%"),
+                    "Cost": st.column_config.NumberColumn("Cost", format="%.1f"),
+                    "RV": st.column_config.NumberColumn("RV", format="%.1f"),
+                    "MV Adjustment (%)": st.column_config.NumberColumn("MV Adjustment (%)", format="%.4f"),
+                    "MV": st.column_config.NumberColumn("MV", format="%.1f"),
+                    "Exit Year": st.column_config.NumberColumn("Exit Year", format="%d", step=1),
+                    "Proceeds": st.column_config.NumberColumn("Proceeds", format="%.1f"),
+                    **{c: st.column_config.NumberColumn(c, format="%.1f") for c in year_cols},
+                },
+            )
+
+            # Push edits back into the shared store. Each row carries the id it came from, so
+            # deleting a row in the middle can't silently reassign another company's model.
+            _dirty = False
+            _seen = []
+            for _, erow in edited_cur.iterrows():
+                _aid = erow.get("id")
+                if _aid is None or (isinstance(_aid, float) and pd.isna(_aid)):
+                    st.session_state["asset_seq"] += 1
+                    _aid = f"N{st.session_state['asset_seq']}"
+                    st.session_state["asset_ids"].append(_aid)
+                    for _f in PER_ASSET_FIELDS:
+                        st.session_state.setdefault(f"am_{_aid}_{_f}", _asset_default(_aid, _f))
+                    _dirty = True
+                _seen.append(_aid)
+                _fields = {
+                    "name": (str(erow["Company Name"]) if pd.notna(erow["Company Name"])
+                             else _asset_default(_aid, "name")),
+                    "inv_date": (pd.to_datetime(erow["Inv. Date"]).date() if pd.notna(erow["Inv. Date"])
+                                 else _asset_default(_aid, "inv_date")),
+                    "cost": float(erow["Cost"]) if pd.notna(erow["Cost"]) else 0.0,
+                    "rv": float(erow["RV"]) if pd.notna(erow["RV"]) else 0.0,
+                    "mv_adj": float(erow["MV Adjustment (%)"]) if pd.notna(erow["MV Adjustment (%)"]) else 0.0,
+                    "exit_cal": (int(erow["Exit Year"]) if pd.notna(erow["Exit Year"])
+                                 else _asset_default(_aid, "exit_cal")),
+                }
+                for _f, _v in _fields.items():
+                    _key = f"am_{_aid}_{_f}"
+                    if st.session_state.get(_key) != _v:
+                        st.session_state[_key] = _v
+                        _dirty = True
+
+            for _aid in list(st.session_state["asset_ids"]):
+                if _aid not in _seen:
+                    st.session_state["asset_ids"].remove(_aid)
+                    _dirty = True
+            if _dirty:
+                st.rerun()
+
+            if asset_ids:
+                cur_total = pd.DataFrame([{
+                    "Company Name": "Total - Current Investments",
+                    "% of RV": 1.0, "% of MV": 1.0,
+                    "Cost": sum(precomputed[a]["cost_m"] for a in asset_ids),
+                    "RV": sum(precomputed[a]["rv_m"] for a in asset_ids),
+                    "MV": sum(precomputed[a]["mv_m"] for a in asset_ids),
+                    **{str(y): sum(precomputed[a]["build"]["cash_flow_to_fund"][i]["exit_proceeds_to_fund"]
+                                   for a in asset_ids)
+                       for i, y in enumerate(proj_years)},
+                    "Proceeds": sum(precomputed[a]["build"]["gross_proceeds_to_fund"] for a in asset_ids),
+                }])
+                st.dataframe(
+                    cur_total.style.format({
+                        "% of RV": "{:.2%}", "% of MV": "{:.2%}", "Cost": "{:,.1f}",
+                        "RV": "{:,.1f}", "MV": "{:,.1f}", "Proceeds": "{:,.1f}",
+                        **{c: "{:,.1f}" for c in year_cols}}, na_rep=""),
+                    width="stretch", hide_index=True,
+                )
+
+        with inv_expanders["cur_lp"]:
+            if not asset_ids:
+                st.caption("Nothing in this block yet.")
+            else:
+                st.caption(
+                    f"The same {len(asset_ids)} companies as the Fund level view, at the selling "
+                    f"LP's {lp_pct*100:.2f}% share. MOIC is unaffected by that scaling, which is "
+                    "why the fund and LP multiples agree."
+                )
+                lp_rows = []
+                for aid in asset_ids:
+                    p = precomputed[aid]
+                    lp_rows.append({
+                        "Company Name": p["name"],
+                        "Inv. Date": p["inv_date"].isoformat() if isinstance(p["inv_date"], date) else "",
+                        "LP Cost": p["cost_m"] * lp_pct, "LP RV": p["rv_m"] * lp_pct,
+                        "LP MV": p["mv_m"] * lp_pct,
+                        **{str(r["year"]): r["exit_proceeds_to_fund"] * lp_pct
+                           for r in p["build"]["cash_flow_to_fund"]},
+                        "LP Proceeds": p["build"]["gross_proceeds_to_fund"] * lp_pct,
+                        "LP MOIC": (p["build"]["gross_proceeds_to_fund"] / p["cost_m"]) if p["cost_m"] > 0 else None,
+                    })
+                _t = {"Company Name": "Total", "Inv. Date": "",
+                      "LP Cost": sum(r["LP Cost"] for r in lp_rows),
+                      "LP RV": sum(r["LP RV"] for r in lp_rows),
+                      "LP MV": sum(r["LP MV"] for r in lp_rows),
+                      **{c: sum(r[c] for r in lp_rows) for c in year_cols},
+                      "LP Proceeds": sum(r["LP Proceeds"] for r in lp_rows)}
+                _t["LP MOIC"] = (_t["LP Proceeds"] / _t["LP Cost"]) if _t["LP Cost"] else None
+                lp_rows.append(_t)
+                st.dataframe(
+                    pd.DataFrame(lp_rows).style.format({
+                        "LP Cost": "{:,.2f}", "LP RV": "{:,.2f}", "LP MV": "{:,.2f}",
+                        "LP Proceeds": "{:,.2f}", "LP MOIC": "{:.2f}x",
+                        **{c: "{:,.2f}" for c in year_cols}}, na_rep=""),
+                    width="stretch", hide_index=True,
+                )
+
+        # ---------------- Post-Report Investments ----------------
         st.markdown("### Post-Report Investments")
         inv_expanders["post_fund"] = st.expander("Fund level", expanded=True)
         inv_expanders["post_lp"] = st.expander("LP level", expanded=False)
 
-if forecast_mode == "Portfolio companies (detailed)":
-    with inv_expanders["cur_fund"]:
-        st.markdown("**Inputs** -- edit any cell; use the ➕ row at the bottom to add a company, "
-                    "or select a row and press delete to remove one.")
-        _ids = st.session_state["asset_ids"]
-        cur_input_df = pd.DataFrame([
-            {
-                "id": aid,
-                "Company Name": _asset_state(aid, "name"),
-                "Inv. Date": pd.to_datetime(_asset_state(aid, "inv_date")),
-                "Cost": float(_asset_state(aid, "cost")),
-                "RV": float(_asset_state(aid, "rv")),
-                "MV Adjustment (%)": float(_asset_state(aid, "mv_adj")),
-                "Exit Year": int(_asset_state(aid, "exit_cal")),
-            }
-            for aid in _ids
-        ], columns=["id", "Company Name", "Inv. Date", "Cost", "RV", "MV Adjustment (%)", "Exit Year"])
+        _gen = bool(st.session_state.get("unfunded_generates_return", True))
+        _hold = int(st.session_state.get("unfunded_hold_years", 4))
+        _moic = float(st.session_state.get("unfunded_moic", 1.75))
 
-        edited_cur = st.data_editor(
-            cur_input_df, num_rows="dynamic", width="stretch", hide_index=True,
-            key="inv_current_editor",
-            column_order=["Company Name", "Inv. Date", "Cost", "RV", "MV Adjustment (%)", "Exit Year"],
-            column_config={
-                "Inv. Date": st.column_config.DateColumn("Inv. Date", format="YYYY-MM-DD"),
-                "Cost": st.column_config.NumberColumn("Cost", format="%.1f"),
-                "RV": st.column_config.NumberColumn("RV", format="%.1f"),
-                "MV Adjustment (%)": st.column_config.NumberColumn("MV Adjustment (%)", format="%.4f"),
-                "Exit Year": st.column_config.NumberColumn("Exit Year", format="%d", step=1),
-            },
-        )
+        def _post_flows(cost, call_rel):
+            """Cost drawn in the call year, the return landing after the assumed hold."""
+            call_year = as_of.year + int(call_rel)
+            flows = {call_year: -float(cost)}
+            proceeds = 0.0
+            if _gen and _hold > 0:
+                ret_year = call_year + _hold
+                if ret_year in proj_years:
+                    proceeds = float(cost) * _moic
+                    flows[ret_year] = flows.get(ret_year, 0.0) + proceeds
+            return flows, proceeds, call_year
 
-        # Push edits back into the shared store. A row carries the id it came from, so a
-        # deletion in the middle of the grid can't silently reassign another company's model.
-        _dirty = False
-        _seen = []
-        for _, erow in edited_cur.iterrows():
-            _aid = erow.get("id")
-            if _aid is None or (isinstance(_aid, float) and pd.isna(_aid)):
-                # A row the user just added: mint an id and seed it from what they typed.
-                st.session_state["asset_seq"] += 1
-                _aid = f"N{st.session_state['asset_seq']}"
-                st.session_state["asset_ids"].append(_aid)
-                _dirty = True
-            _seen.append(_aid)
-            _fields = {
-                "name": (str(erow["Company Name"]) if pd.notna(erow["Company Name"])
-                         else _asset_default(_aid, "name")),
-                "inv_date": (pd.to_datetime(erow["Inv. Date"]).date() if pd.notna(erow["Inv. Date"])
-                             else _asset_default(_aid, "inv_date")),
-                "cost": float(erow["Cost"]) if pd.notna(erow["Cost"]) else 0.0,
-                "rv": float(erow["RV"]) if pd.notna(erow["RV"]) else 0.0,
-                "mv_adj": float(erow["MV Adjustment (%)"]) if pd.notna(erow["MV Adjustment (%)"]) else 0.0,
-                "exit_cal": (int(erow["Exit Year"]) if pd.notna(erow["Exit Year"])
-                             else _asset_default(_aid, "exit_cal")),
-            }
-            for _f, _v in _fields.items():
-                _key = f"am_{_aid}_{_f}"
-                if st.session_state.get(_key) != _v:
-                    st.session_state[_key] = _v
-                    _dirty = True
+        with inv_expanders["post_fund"]:
+            n_add_p, add_p = _rows_to_add("investment", "investments", "post_add")
+            if add_p:
+                for _ in range(n_add_p):
+                    st.session_state["followon_rows"].append(
+                        {"Name": "New investment", "Cost": 0.0, "Year": 1})
+                st.rerun()
 
-        for _aid in list(st.session_state["asset_ids"]):
-            if _aid not in _seen:
-                st.session_state["asset_ids"].remove(_aid)
-                _dirty = True
-        if _dirty:
-            st.rerun()
+            post_grid_rows = []
+            for fr in st.session_state["followon_rows"]:
+                flows, proceeds, call_year = _post_flows(fr.get("Cost", 0.0), fr.get("Year", 1))
+                post_grid_rows.append({
+                    "Company Name": fr.get("Name", ""),
+                    "Year": int(fr.get("Year", 1)),
+                    "Inv. Date": str(call_year),
+                    "Cost": float(fr.get("Cost", 0.0)),
+                    "RV": float(fr.get("Cost", 0.0)),
+                    "MV": float(fr.get("Cost", 0.0)),
+                    **{str(y): flows.get(y, 0.0) for y in proj_years},
+                    "Proceeds": proceeds,
+                })
+            post_grid = pd.DataFrame(post_grid_rows, columns=(
+                ["Company Name", "Year", "Inv. Date", "Cost", "RV", "MV"] + year_cols + ["Proceeds"]))
 
-    with inv_expanders["post_fund"]:
-        st.markdown("**Inputs** -- investments committed after the reporting date. Add rows the "
-                    "same way; the hold period and MOIC applied to them are in sidebar section 4.")
-        default_followons = pd.DataFrame([
-            # The source model's post-report-date investment: a new company committed after
-            # the reporting date, funded in the first forecast year.
-            {"Name": "Asset F (post-report)", "Amount ($M)": 90.0, "Year": 1},
-        ])
-        known_followons_df = st.data_editor(
-            default_followons, num_rows="dynamic", width="stretch", hide_index=True,
-            key="followons_editor",
-            column_config={
-                "Amount ($M)": st.column_config.NumberColumn("Amount ($M)", format="%.1f"),
-                "Year": st.column_config.NumberColumn(
-                    "Year", format="%d", step=1,
-                    help="Forecast year the capital is called, counted off the as-of date.",
-                ),
-            },
-        )
-else:
-    known_followons_df = pd.DataFrame(columns=["Name", "Amount ($M)", "Year"])
+            edited_post = st.data_editor(
+                post_grid, num_rows="dynamic", width="stretch", hide_index=True,
+                key="followons_editor",
+                disabled=["Inv. Date", "RV", "MV", "Proceeds"] + year_cols,
+                column_config={
+                    "Year": st.column_config.NumberColumn(
+                        "Year", format="%d", step=1,
+                        help="Forecast year the capital is called, counted off the as-of date."),
+                    "Cost": st.column_config.NumberColumn("Cost", format="%.1f"),
+                    "RV": st.column_config.NumberColumn("RV", format="%.1f"),
+                    "MV": st.column_config.NumberColumn("MV", format="%.1f"),
+                    "Proceeds": st.column_config.NumberColumn("Proceeds", format="%.1f"),
+                    **{c: st.column_config.NumberColumn(c, format="%.1f") for c in year_cols},
+                },
+            )
+
+            new_followons = [
+                {"Name": str(r["Company Name"]) if pd.notna(r["Company Name"]) else "New investment",
+                 "Cost": float(r["Cost"]) if pd.notna(r["Cost"]) else 0.0,
+                 "Year": int(r["Year"]) if pd.notna(r["Year"]) else 1}
+                for _, r in edited_post.iterrows()
+            ]
+            if new_followons != st.session_state["followon_rows"]:
+                st.session_state["followon_rows"] = new_followons
+                st.rerun()
+
+            st.caption(
+                "Cost is drawn in the call year (shown negative), and the return lands after the "
+                "assumed hold period at the assumed MOIC (sidebar section 4). Reported and Market "
+                "Value are held at cost, since a brand new position has no independent mark yet."
+            )
+
+        with inv_expanders["post_lp"]:
+            if not st.session_state["followon_rows"]:
+                st.caption("Nothing in this block yet.")
+            else:
+                st.caption(
+                    f"The same {len(st.session_state['followon_rows'])} investment(s) as the Fund "
+                    f"level view, at the selling LP's {lp_pct*100:.2f}% share."
+                )
+                plp = []
+                for fr in st.session_state["followon_rows"]:
+                    flows, proceeds, call_year = _post_flows(fr.get("Cost", 0.0), fr.get("Year", 1))
+                    cost = float(fr.get("Cost", 0.0))
+                    plp.append({
+                        "Company Name": fr.get("Name", ""), "Inv. Date": str(call_year),
+                        "LP Cost": cost * lp_pct, "LP RV": cost * lp_pct, "LP MV": cost * lp_pct,
+                        **{str(y): flows.get(y, 0.0) * lp_pct for y in proj_years},
+                        "LP Proceeds": proceeds * lp_pct,
+                        "LP MOIC": (proceeds / cost) if cost > 0 else None,
+                    })
+                _t = {"Company Name": "Total", "Inv. Date": "",
+                      "LP Cost": sum(r["LP Cost"] for r in plp),
+                      "LP RV": sum(r["LP RV"] for r in plp),
+                      "LP MV": sum(r["LP MV"] for r in plp),
+                      **{c: sum(r[c] for r in plp) for c in year_cols},
+                      "LP Proceeds": sum(r["LP Proceeds"] for r in plp)}
+                _t["LP MOIC"] = (_t["LP Proceeds"] / _t["LP Cost"]) if _t["LP Cost"] else None
+                plp.append(_t)
+                st.dataframe(
+                    pd.DataFrame(plp).style.format({
+                        "LP Cost": "{:,.2f}", "LP RV": "{:,.2f}", "LP MV": "{:,.2f}",
+                        "LP Proceeds": "{:,.2f}", "LP MOIC": "{:.2f}x",
+                        **{c: "{:,.2f}" for c in year_cols}}, na_rep=""),
+                    width="stretch", hide_index=True,
+                )
+
+# The fund forecast consumes the follow-ons in the same shape it always has.
+known_followons_df = pd.DataFrame(
+    [{"Name": r["Name"], "Amount ($M)": r["Cost"], "Year": r["Year"]}
+     for r in st.session_state.get("followon_rows", [])],
+    columns=["Name", "Amount ($M)", "Year"],
+)
 
 
 with tab5:
@@ -354,31 +662,26 @@ with tab5:
             "horizon and pricing all follow from what you set below."
         )
 
-        asset_ids = st.session_state["asset_ids"]
-        # Fund-level totals have to be known before any company renders (% of Fund RV needs
-        # the total; the projection grid needs the longest hold). Both are read straight from
-        # session_state, so they reflect this run's edits rather than lagging a rerun behind.
-        total_rv = sum(float(_asset_state(aid, "rv")) for aid in asset_ids) if asset_ids else 0.0
-        nav_current = total_rv * 1_000_000
-        exit_rels = [max(1, int(_asset_state(aid, "exit_cal")) - as_of.year) for aid in asset_ids]
-        remaining_years = max(exit_rels) if exit_rels else 1
-        proj_years = [as_of.year + t for t in range(1, max(1, remaining_years) + 1)]
-
+        # Totals and every asset's model were computed above, before any widget rendered --
+        # that is what lets the Investments grid show inputs and results in one table.
         hc1, hc2, hc3 = st.columns(3)
         hc1.metric("Companies", f"{len(asset_ids)}")
         hc2.metric("Aggregate Reported Value", f"${nav_current:,.0f}")
         hc3.metric("Forecast horizon", f"{remaining_years} yrs ({proj_years[0]}-{proj_years[-1]})")
 
-        if st.button("➕ Add a company", key="am_add"):
-            st.session_state["asset_seq"] += 1
-            st.session_state["asset_ids"].append(f"N{st.session_state['asset_seq']}")
+        n_add_am, add_am = _rows_to_add("company", "companies", "am_add")
+        if add_am:
+            for _ in range(n_add_am):
+                st.session_state["asset_seq"] += 1
+                st.session_state["asset_ids"].append(f"N{st.session_state['asset_seq']}")
             st.rerun()
 
         if not asset_ids:
-            st.info("No companies yet -- click **Add a company** above to start one.")
+            st.info("No companies yet -- add one above, or in the Investments tab.")
 
         for aid in list(asset_ids):
-            name = str(_asset_state(aid, "name"))
+            pre = precomputed[aid]
+            name = pre["name"]
 
             with st.expander(f"{name}", expanded=False):
                 sc1, sc2 = st.columns([4, 1])
@@ -387,7 +690,7 @@ with tab5:
                         st.session_state["asset_ids"].remove(aid)
                         st.rerun()
                 drives = st.checkbox(
-                    "Use this asset model to drive the fund forecast", value=True,
+                    "Use this asset model to drive the fund forecast",
                     key=f"am_{aid}_drives",
                     help="On: this company's expected return in the forecast is whatever this "
                          "model implies (its exit proceeds compounded back from today's Market "
@@ -444,16 +747,16 @@ with tab5:
                         "used when this asset model is switched off."
                     )
                     exit_pct_1 = st.number_input(
-                        "Exit % in the exit year", min_value=0.0, max_value=100.0, value=100.0,
-                        step=5.0, format="%.1f", key=f"am_{aid}_exit_pct_1",
+                        "Exit % in the exit year", min_value=0.0, max_value=100.0, step=5.0,
+                        format="%.1f", key=f"am_{aid}_exit_pct_1",
                     )
                     exit_cal_2 = int(st.number_input(
                         "Second exit year", min_value=as_of.year + 1, max_value=as_of.year + 30,
-                        value=max(as_of.year + 1, exit_cal), step=1, key=f"am_{aid}_exit_cal_2",
+                        step=1, key=f"am_{aid}_exit_cal_2",
                     ))
                     exit_pct_2 = st.number_input(
                         "Exit % of what's left, in that year", min_value=0.0, max_value=100.0,
-                        value=0.0, step=5.0, format="%.1f", key=f"am_{aid}_exit_pct_2",
+                        step=5.0, format="%.1f", key=f"am_{aid}_exit_pct_2",
                     )
                     expected_return_fallback = st.number_input(
                         "Fallback Expected Return (%)", step=1.0, format="%.1f",
@@ -467,78 +770,69 @@ with tab5:
                     key=f"am_{aid}_entry_revenue",
                 )
                 entry_margin = e2.number_input(
-                    "Entry EBITDA Margin (%)", min_value=0.0, max_value=100.0,
-                    value=COMMON_DEFAULTS["entry_ebitda_margin"], step=0.5, format="%.1f",
-                    key=f"am_{aid}_entry_margin",
+                    "Entry EBITDA Margin (%)", min_value=0.0, max_value=100.0, step=0.5,
+                    format="%.1f", key=f"am_{aid}_entry_margin",
                 )
                 entry_ev_mult = e3.number_input(
-                    "Entry EV/EBITDA (x)", min_value=0.0, value=COMMON_DEFAULTS["entry_ev_multiple"],
-                    step=0.5, format="%.1f", key=f"am_{aid}_entry_ev",
+                    "Entry EV/EBITDA (x)", min_value=0.0, step=0.5, format="%.1f",
+                    key=f"am_{aid}_entry_ev",
                 )
                 e4, e5 = st.columns(2)
                 entry_nd_mult = e4.number_input(
-                    "Entry Net Debt / EBITDA (x)", min_value=0.0,
-                    value=COMMON_DEFAULTS["entry_net_debt_ebitda"], step=0.25, format="%.2f",
+                    "Entry Net Debt / EBITDA (x)", min_value=0.0, step=0.25, format="%.2f",
                     key=f"am_{aid}_entry_nd",
                 )
                 fund_ownership = e5.number_input(
-                    "Fund Ownership (%)", min_value=0.0, max_value=100.0,
-                    value=COMMON_DEFAULTS["fund_ownership"], step=1.0, format="%.1f",
+                    "Fund Ownership (%)", min_value=0.0, max_value=100.0, step=1.0, format="%.1f",
                     key=f"am_{aid}_ownership",
                 )
 
                 st.markdown("**Operating Projections ($mm)**")
-                default_ops = pd.DataFrame(
-                    [
-                        {"Line item": "Revenue Growth (%)",
-                         **{str(y): COMMON_DEFAULTS["revenue_growth"] for y in proj_years}},
-                        {"Line item": "EBITDA Margin (%)",
-                         **{str(y): COMMON_DEFAULTS["ebitda_margin"] for y in proj_years}},
-                        {"Line item": "FCF Conversion (% of EBITDA)",
-                         **{str(y): COMMON_DEFAULTS["fcf_conversion"] for y in proj_years}},
-                    ]
-                )
+                _ops = pre["ops"]
+                ops_grid = pd.DataFrame([
+                    {"Line item": "Revenue Growth (%)",
+                     **{str(y): _ops["growth"][i] for i, y in enumerate(proj_years)}},
+                    {"Line item": "EBITDA Margin (%)",
+                     **{str(y): _ops["margin"][i] for i, y in enumerate(proj_years)}},
+                    {"Line item": "FCF Conversion (% of EBITDA)",
+                     **{str(y): _ops["conv"][i] for i, y in enumerate(proj_years)}},
+                ])
                 ops_df = st.data_editor(
-                    default_ops, width="stretch", hide_index=True, key=f"am_{aid}_ops",
+                    ops_grid, width="stretch", hide_index=True, key=f"am_{aid}_ops",
                     disabled=["Line item"],
                 )
 
                 def _row_vals(frame, label, fallback):
                     match = frame[frame["Line item"] == label]
                     if len(match) == 0:
-                        return [fallback / 100] * len(proj_years)
+                        return [fallback] * len(proj_years)
                     r = match.iloc[0]
                     out = []
                     for y in proj_years:
                         try:
-                            out.append(float(r[str(y)]) / 100)
+                            out.append(float(r[str(y)]))
                         except (KeyError, TypeError, ValueError):
-                            out.append(fallback / 100)
+                            out.append(fallback)
                     return out
 
-                growth_v = _row_vals(ops_df, "Revenue Growth (%)", COMMON_DEFAULTS["revenue_growth"])
-                margin_v = _row_vals(ops_df, "EBITDA Margin (%)", COMMON_DEFAULTS["ebitda_margin"])
-                conv_v = _row_vals(ops_df, "FCF Conversion (% of EBITDA)", COMMON_DEFAULTS["fcf_conversion"])
+                _edited_ops = {
+                    "growth": _row_vals(ops_df, "Revenue Growth (%)", COMMON_DEFAULTS["revenue_growth"]),
+                    "margin": _row_vals(ops_df, "EBITDA Margin (%)", COMMON_DEFAULTS["ebitda_margin"]),
+                    "conv": _row_vals(ops_df, "FCF Conversion (% of EBITDA)", COMMON_DEFAULTS["fcf_conversion"]),
+                }
+                if _edited_ops != _ops:
+                    # The build above was made from the stored vectors; a change here means the
+                    # store is stale, so save it and rerun so every view reflects the new curve.
+                    st.session_state[f"am_{aid}_ops_store"] = _edited_ops
+                    st.rerun()
 
                 st.markdown("**Exit Valuation**")
                 exit_ev_mult = st.number_input(
-                    "Exit EV/EBITDA (x)", min_value=0.0, value=COMMON_DEFAULTS["exit_ev_multiple"],
-                    step=0.5, format="%.1f", key=f"am_{aid}_exit_ev",
+                    "Exit EV/EBITDA (x)", min_value=0.0, step=0.5, format="%.1f",
+                    key=f"am_{aid}_exit_ev",
                 )
 
-                build = asset_model_build(
-                    entry_revenue=entry_revenue,
-                    entry_ebitda_margin=entry_margin / 100,
-                    entry_ev_multiple=entry_ev_mult,
-                    entry_net_debt_ebitda=entry_nd_mult,
-                    fund_ownership_pct=fund_ownership / 100,
-                    years=proj_years,
-                    revenue_growth=growth_v,
-                    ebitda_margin=margin_v,
-                    fcf_conversion=conv_v,
-                    exit_year=exit_cal,
-                    exit_ev_multiple=exit_ev_mult,
-                )
+                build = pre["build"]
 
                 # Entry block, computed -- shown under its inputs so the build reads top to bottom.
                 entry_calc = pd.DataFrame([
@@ -587,10 +881,7 @@ with tab5:
                          "circulated. Kept as a hardcode so a re-run can be diffed against what "
                          "the client last saw. Set to 0 to ignore.",
                 )
-                rets = asset_model_returns(
-                    build["gross_proceeds_to_fund"], cost_m, rv_m, hold_years,
-                    prior_proceeds if prior_proceeds != 0 else None,
-                )
+                rets = pre["returns"]
 
                 # --- render the computed blocks, in the source model's order ---
                 st.markdown("_Entry Assumptions (computed)_")
@@ -628,25 +919,6 @@ with tab5:
                     f"${build['gross_proceeds_to_fund'] * lp_pct:,.2f}mm in {exit_cal}."
                 )
 
-                asset_builds[name] = {
-                    "build": build, "returns": rets, "drives_forecast": drives,
-                    "exit_cal_year": exit_cal, "hold_years": hold_years, "cost_m": cost_m, "rv_m": rv_m,
-                }
-                # The portfolio table the fund-level forecast consumes is assembled here,
-                # from each company's own Deal Snapshot -- one source of truth, no separate
-                # table to keep in sync.
-                portfolio_rows.append({
-                    "Company": name,
-                    "Investment Date": inv_date,
-                    "Cost Basis ($M)": cost_m,
-                    "Reported Value ($M)": rv_m,
-                    "MV Adjustment (%)": adj_pct,
-                    "Expected Return (%)": expected_return_fallback,
-                    "Exit Year 1": exit_rel,
-                    "Exit % 1": exit_pct_1,
-                    "Exit Year 2": max(1, exit_cal_2 - as_of.year),
-                    "Exit % 2": exit_pct_2,
-                })
 
 # --------------------------------------------------------------------------
 # Remaining sidebar inputs
@@ -675,15 +947,17 @@ st.sidebar.caption(
 )
 
 unfunded_generates_return = st.sidebar.checkbox(
-    "Unfunded commitment generates its own return", value=True,
+    "Unfunded commitment generates its own return", key="unfunded_generates_return",
     help="A capital call doesn't just sit as an outflow -- it funds a new investment that "
          "itself goes on to return money. Turn this on to project a return on every future "
          "call, a fixed hold period and MOIC after which it lands.",
 )
 if unfunded_generates_return:
     uc1, uc2 = st.sidebar.columns(2)
-    unfunded_hold_years = uc1.number_input("Hold period (years)", min_value=1, value=4, step=1)
-    unfunded_moic = uc2.number_input("Assumed MOIC (x)", min_value=0.1, value=1.75, step=0.05, format="%.2f")
+    unfunded_hold_years = uc1.number_input("Hold period (years)", min_value=1, step=1,
+                                           key="unfunded_hold_years")
+    unfunded_moic = uc2.number_input("Assumed MOIC (x)", min_value=0.1, step=0.05, format="%.2f",
+                                     key="unfunded_moic")
     st.sidebar.caption(
         "Each call in year Y returns amount x MOIC in year Y + hold period. Calls that would "
         "mature beyond the forecast horizon are excluded (flagged below) rather than distorting "
@@ -1206,158 +1480,17 @@ with tab2:
     st.plotly_chart(fig2, width="stretch")
 
 # --------------------------------------------------------------------------
-# Investments tab, part 2 of 2: the computed tables
+# Investments tab: the blind-pool footnote
 # --------------------------------------------------------------------------
-# Appended into the expanders created above, now that the asset models and the fund
-# forecast have run. Fund and LP are two views of one list of companies, so their row
-# counts match by construction -- there is no second list to keep in step.
-if forecast_mode == "Portfolio companies (detailed)":
-    if True:
-        inv_years = [as_of.year + t for t in range(1, max(1, remaining_years) + 1)]
-        year_cols = [str(y) for y in inv_years]
-
-        def _inv_tables(records):
-            """Splits one investment block into its fund-level and LP-level views.
-
-            records: dicts with name, inv_date, cost, rv, mv_adj, mv, flows {year: $mm},
-            proceeds -- all fund level, in $mm. The LP view is the same schedule scaled by
-            the selling LP's ownership; MOIC is unchanged by that scaling, which is why the
-            fund and LP multiples agree.
-            """
-            tot_rv = sum(r["rv"] for r in records)
-            tot_mv = sum(r["mv"] for r in records)
-            fund_rows, lp_rows = [], []
-            for r in records:
-                fr = {
-                    "Company Name": r["name"], "Inv. Date": r["inv_date"],
-                    "% of RV": (r["rv"] / tot_rv) if tot_rv else 0.0,
-                    "% of MV": (r["mv"] / tot_mv) if tot_mv else 0.0,
-                    "Cost": r["cost"], "RV": r["rv"], "MV Adjustment": r["mv_adj"], "MV": r["mv"],
-                }
-                for y in inv_years:
-                    fr[str(y)] = r["flows"].get(y, 0.0)
-                fr["Proceeds"] = r["proceeds"]
-                fund_rows.append(fr)
-
-                lr = {
-                    "Company Name": r["name"], "Inv. Date": r["inv_date"],
-                    "LP Cost": r["cost"] * lp_pct, "LP RV": r["rv"] * lp_pct, "LP MV": r["mv"] * lp_pct,
-                }
-                for y in inv_years:
-                    lr[str(y)] = r["flows"].get(y, 0.0) * lp_pct
-                lr["LP Proceeds"] = r["proceeds"] * lp_pct
-                lr["LP MOIC"] = (r["proceeds"] / r["cost"]) if r["cost"] > 0 else None
-                lp_rows.append(lr)
-
-            if fund_rows:
-                tf = {"Company Name": "Total", "Inv. Date": "",
-                      "% of RV": sum(x["% of RV"] for x in fund_rows),
-                      "% of MV": sum(x["% of MV"] for x in fund_rows),
-                      "Cost": sum(x["Cost"] for x in fund_rows), "RV": sum(x["RV"] for x in fund_rows),
-                      "MV Adjustment": None, "MV": sum(x["MV"] for x in fund_rows)}
-                for c in year_cols:
-                    tf[c] = sum(x[c] for x in fund_rows)
-                tf["Proceeds"] = sum(x["Proceeds"] for x in fund_rows)
-                fund_rows.append(tf)
-
-                tl = {"Company Name": "Total", "Inv. Date": "",
-                      "LP Cost": sum(x["LP Cost"] for x in lp_rows),
-                      "LP RV": sum(x["LP RV"] for x in lp_rows),
-                      "LP MV": sum(x["LP MV"] for x in lp_rows)}
-                for c in year_cols:
-                    tl[c] = sum(x[c] for x in lp_rows)
-                tl["LP Proceeds"] = sum(x["LP Proceeds"] for x in lp_rows)
-                tl["LP MOIC"] = (tl["LP Proceeds"] / tl["LP Cost"]) if tl["LP Cost"] else None
-                lp_rows.append(tl)
-
-            return pd.DataFrame(fund_rows), pd.DataFrame(lp_rows)
-
-        def _show(fund_df, lp_df, key_prefix):
-            money = {c: "{:,.1f}" for c in year_cols}
-            with inv_expanders[f"{key_prefix}_fund"]:
-                st.markdown("**Schedule** -- computed from the inputs above.")
-                if len(fund_df) == 0:
-                    st.caption("Nothing in this block yet.")
-                else:
-                    st.dataframe(
-                        fund_df.style.format({
-                            "% of RV": "{:.2%}", "% of MV": "{:.2%}", "MV Adjustment": "{:+.2%}",
-                            "Cost": "{:,.1f}", "RV": "{:,.1f}", "MV": "{:,.1f}",
-                            "Proceeds": "{:,.1f}", **money,
-                        }, na_rep=""),
-                        width="stretch", hide_index=True,
-                    )
-            with inv_expanders[f"{key_prefix}_lp"]:
-                if len(lp_df) == 0:
-                    st.caption("Nothing in this block yet.")
-                else:
-                    st.caption(
-                        f"The same {max(0, len(lp_df) - 1)} compan(y/ies) as the Fund level view, "
-                        f"at the selling LP's {lp_pct*100:.2f}% share."
-                    )
-                    st.dataframe(
-                        lp_df.style.format({
-                            "LP Cost": "{:,.2f}", "LP RV": "{:,.2f}", "LP MV": "{:,.2f}",
-                            "LP Proceeds": "{:,.2f}", "LP MOIC": "{:.2f}x", **money,
-                        }, na_rep=""),
-                        width="stretch", hide_index=True,
-                    )
-
-        current_records = []
-        for r in portfolio_rows:
-            am = asset_builds.get(r["Company"])
-            flows = {}
-            proceeds = 0.0
-            if am is not None:
-                flows = {c["year"]: c["exit_proceeds_to_fund"] for c in am["build"]["cash_flow_to_fund"]}
-                proceeds = am["build"]["gross_proceeds_to_fund"]
-            inv_d = r.get("Investment Date")
-            current_records.append({
-                "name": r["Company"],
-                "inv_date": inv_d.isoformat() if isinstance(inv_d, date) else str(inv_d),
-                "cost": float(r["Cost Basis ($M)"]), "rv": float(r["Reported Value ($M)"]),
-                "mv_adj": float(r["MV Adjustment (%)"]) / 100,
-                "mv": float(r["Reported Value ($M)"]) * (1 + float(r["MV Adjustment (%)"]) / 100),
-                "flows": flows, "proceeds": proceeds,
-            })
-        cur_fund, cur_lp = _inv_tables(current_records)
-        _show(cur_fund, cur_lp, "cur")
-
-        post_records = []
-        if known_followons_df is not None and len(known_followons_df) > 0:
-            for _, f in known_followons_df.iterrows():
-                try:
-                    amt = float(f["Amount ($M)"])
-                    call_year_rel = int(f["Year"])
-                except (TypeError, ValueError):
-                    continue
-                call_year = as_of.year + call_year_rel
-                flows = {call_year: -amt}
-                proceeds = 0.0
-                if unfunded_generates_return and unfunded_hold_years > 0:
-                    ret_year = call_year + int(unfunded_hold_years)
-                    if ret_year in inv_years:
-                        proceeds = amt * float(unfunded_moic)
-                        flows[ret_year] = flows.get(ret_year, 0.0) + proceeds
-                post_records.append({
-                    "name": str(f["Name"]), "inv_date": str(call_year),
-                    "cost": amt, "rv": amt, "mv_adj": 0.0, "mv": amt,
-                    "flows": flows, "proceeds": proceeds,
-                })
-        post_fund, post_lp = _inv_tables(post_records)
-        _show(post_fund, post_lp, "post")
-        with inv_expanders["post_fund"]:
-            st.caption(
-                "Cost is drawn in the call year (shown negative), and the return lands after the "
-                "assumed hold period at the assumed MOIC. Reported and Market Value are held at "
-                "cost, since a brand new position has no independent mark yet."
-            )
-            if blind_pool_amount > 0:
-                st.caption(
-                    f"Separately, ${blind_pool_amount:,.0f} of blind-pool commitment (fund level) "
-                    f"is drawn over {blind_pool_years} year(s). It isn't a line here because it "
-                    "isn't a named investment yet -- it flows through the Cash Flow Forecast."
-                )
+# The schedules themselves were rendered above, before the per-asset widgets. Only
+# this note has to wait, because the blind pool is a sidebar input that renders later.
+if forecast_mode == "Portfolio companies (detailed)" and blind_pool_amount > 0:
+    with inv_expanders["post_fund"]:
+        st.caption(
+            f"Separately, ${blind_pool_amount:,.0f} of blind-pool commitment (fund level) is "
+            f"drawn over {blind_pool_years} year(s). It isn't a line here because it isn't a "
+            "named investment yet -- it flows through the Cash Flow Forecast."
+        )
 
 with tab4:
     st.subheader("Buyer vs. Seller")
