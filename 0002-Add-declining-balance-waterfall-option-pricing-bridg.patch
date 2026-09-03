@@ -1,0 +1,563 @@
+From 2d7ae9dc639b0a0ddc01301e9260998602a92f96 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 09:38:21 +0000
+Subject: [PATCH 2/2] Add declining-balance waterfall option, pricing bridge,
+ and return/timing analytics
+
+Round-2 gaps against the real secondaries pricing template:
+- apply_carry_waterfall_declining_balance(): an alternate European waterfall where
+  a hurdle balance rolls forward (grows by the preferred return on itself, shrinks
+  as distributions are applied to it) instead of comparing against a single
+  compounded threshold. Both are legitimate, kept side by side via a sidebar
+  toggle -- the existing compounded-threshold waterfall stays the default.
+- cash_flow_duration(): distribution-weighted average time until cash comes back.
+- New "Analytics & Pricing Bridge" tab: Gross (GP-reported, optional input) vs Net
+  (LP actual) to-date performance, MV CAGR, cash-flow duration, RV/MV multiple
+  (portfolio mode), MOIC unadjusted (TVPI) vs adjusted for CFs (seller-scenario
+  MOIC), and a Reported Value -> Market Value -> Gross Exposure -> Net Funded
+  Exposure -> Net Effective Price bridge.
+- Portfolio mode's EV/EBITDA expander now also shows each company's full
+  Revenue/EBITDA/FCF/Net Debt year-by-year schedule, not just the summary metrics.
+
+Verified with 20 independent checks in test_v3_features.py (manual re-derivation,
+not re-calling the functions under test) plus 10 Streamlit AppTest smoke
+combinations covering every new feature alone and combined with round-1's.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01767TxB9iBxKLrhvhPCK8Ct
+---
+ app.py              | 158 ++++++++++++++++++++++++++++++++++++++++++--
+ finance_engine.py   |  80 ++++++++++++++++++++++
+ smoke_test_app.py   |  58 ++++++++++++++++
+ test_v3_features.py | 134 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 425 insertions(+), 5 deletions(-)
+ create mode 100644 test_v3_features.py
+
+diff --git a/app.py b/app.py
+index 6719903..10b37e8 100644
+--- a/app.py
++++ b/app.py
+@@ -15,8 +15,10 @@ import streamlit as st
+ from ai_agent import ask_agent
+ from finance_engine import (
+     apply_carry_waterfall,
++    apply_carry_waterfall_declining_balance,
+     build_unfunded_returns,
+     build_unfunded_schedule,
++    cash_flow_duration,
+     ebitda_exit_value,
+     forecast_cashflows,
+     forecast_from_portfolio,
+@@ -239,6 +241,33 @@ accrued_carry = st.sidebar.number_input(
+          "reduces the net value actually available to the LP, separate from carry the "
+          "waterfall above computes on future distributions."
+ )
++waterfall_style = st.sidebar.radio(
++    "Waterfall style", ["Compounded threshold (default)", "Declining hurdle balance"], index=0,
++    help="Both are legitimate European waterfalls, they just book the preferred return "
++         "differently. Compounded threshold: distributions compare against a single "
++         "target (all historical calls compounded to today at the hurdle rate) -- once "
++         "cumulative LP distributions cross it, carry kicks in. Declining hurdle "
++         "balance: a running balance (starting at unreturned paid-in capital) accrues "
++         "the hurdle rate on itself and shrinks as distributions are applied to it; "
++         "carry kicks in once that balance hits zero.",
++)
++gp_catchup_rate = 0.0
++if waterfall_style == "Declining hurdle balance":
++    gp_catchup_rate = st.sidebar.slider(
++        "GP catch-up (%, 0 = none)", 0.0, 100.0, 0.0, step=5.0,
++        help="Not the carry rate -- this only controls how fast the GP catches up to "
++             "the full carry_rate split once the hurdle clears. 0% (default) means a "
++             "straight carry_rate split from the first post-hurdle dollar.",
++    ) / 100
++
++st.sidebar.write("GP-reported Gross performance to date (optional -- shown next to the LP's actual Net figures):")
++gpc1, gpc2 = st.sidebar.columns(2)
++gp_reported_gross_moic = gpc1.number_input("Gross MOIC (x)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
++gp_reported_gross_irr = gpc2.number_input("Gross IRR (%)", min_value=0.0, value=0.0, step=0.5, format="%.1f") / 100
++st.sidebar.caption(
++    "Gross (before fees/carry) performance isn't derivable from the LP's own cash flows -- "
++    "it's whatever the GP reports. Leave at 0 to hide the comparison."
++)
+ 
+ st.sidebar.header("6. Leverage (optional)")
+ use_leverage = st.sidebar.checkbox("Buyer finances part of the purchase with a facility", value=False)
+@@ -338,9 +367,14 @@ else:
+     portfolio_display = pd.DataFrame(portfolio_display_rows)
+ 
+ if apply_fees:
+-    forecast_rows = apply_carry_waterfall(
+-        cf_dates, calls_lp, to_date.distributions, forecast_rows, hurdle_rate, carry_rate
+-    )
++    if waterfall_style == "Declining hurdle balance":
++        forecast_rows = apply_carry_waterfall_declining_balance(
++            to_date.paid_in, to_date.distributions, forecast_rows, hurdle_rate, carry_rate, gp_catchup_rate
++        )
++    else:
++        forecast_rows = apply_carry_waterfall(
++            cf_dates, calls_lp, to_date.distributions, forecast_rows, hurdle_rate, carry_rate
++        )
+     distribution_key = "lp_distribution"
+ else:
+     distribution_key = "gross_distribution"
+@@ -377,6 +411,28 @@ if use_leverage and leverage_pct > 0:
+         unfunded_returns,
+     )
+ 
++# --------------------------------------------------------------------------
++# Analytics: MV CAGR, cash-flow duration, RV/MV multiple, MOIC adjusted for CFs
++# --------------------------------------------------------------------------
++cf_duration_years = cash_flow_duration(forecast_rows, distribution_key, as_of)
++terminal_value = sum(r[distribution_key] for r in forecast_rows) + (forecast_rows[-1]["ending_nav"] if forecast_rows else 0.0)
++mv_cagr = implied_annual_return(net_nav, terminal_value, cf_duration_years) if cf_duration_years > 0 else 0.0
++
++rv_mv_multiple = None
++if portfolio_display is not None and len(portfolio_display) > 0:
++    rv_total = portfolio_display["Reported Value (Fund)"].sum()
++    mv_total = portfolio_display["Market Value (Fund)"].sum()
++    rv_mv_multiple = rv_total / mv_total if mv_total else None
++
++# "Unadjusted for CFs" = the raw hold-at-par TVPI already computed to date; "adjusted"
++# = the seller (0%-discount) pricing scenario's MOIC, which nets the purchase price
++# against actual projected LP distributions + unfunded returns -- i.e. time/cash-flow
++# aware, vs. TVPI's simple point-in-time snapshot.
++seller_row_for_moic = secondary_pricing(net_nav, forecast_rows, as_of, [0.0], distribution_key,
++                                         unfunded_calls, unfunded_returns)[0]
++moic_unadjusted = to_date.tvpi
++moic_adjusted = seller_row_for_moic["moic"]
++
+ metrics_context = {
+     "fund_lp": {
+         "fund_commitment": fund_commitment,
+@@ -431,13 +487,26 @@ metrics_context = {
+         "initial_draw": leverage_result["initial_draw"] if leverage_result else None,
+         "equity_invested": leverage_result["equity_invested"] if leverage_result else None,
+     } if use_leverage else None,
++    "analytics": {
++        "waterfall_style": waterfall_style,
++        "gp_catchup_rate": gp_catchup_rate,
++        "gross_moic_reported": gp_reported_gross_moic or None,
++        "gross_irr_reported": gp_reported_gross_irr or None,
++        "net_moic_to_date": to_date.tvpi,
++        "net_irr_to_date": to_date.irr,
++        "mv_cagr": mv_cagr,
++        "cash_flow_duration_years": cf_duration_years,
++        "rv_mv_multiple": rv_mv_multiple,
++        "moic_unadjusted_for_cfs": moic_unadjusted,
++        "moic_adjusted_for_cfs": moic_adjusted,
++    },
+ }
+ 
+ # --------------------------------------------------------------------------
+ # Tabs
+ # --------------------------------------------------------------------------
+-tab1, tab2, tab3, tab4 = st.tabs(
+-    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "AI Assistant"]
++tab1, tab2, tab3, tab4, tab5 = st.tabs(
++    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "Analytics & Pricing Bridge", "AI Assistant"]
+ )
+ 
+ with tab1:
+@@ -495,6 +564,15 @@ with tab2:
+                         f"implied return is what compounds the company's LP-level current Market "
+                         f"Value to that LP-level exit proceeds by the exit year."
+                     )
++                    sched_df = pd.DataFrame(d["schedule"])
++                    st.dataframe(
++                        sched_df.style.format({
++                            "revenue": "${:,.0f}", "ebitda": "${:,.0f}", "fcf": "${:,.0f}",
++                            "beginning_net_debt": "${:,.0f}", "ending_net_debt": "${:,.0f}",
++                        }),
++                        width="stretch", hide_index=True,
++                    )
++                    st.divider()
+ 
+     fdf = pd.DataFrame(forecast_rows)
+ 
+@@ -671,6 +749,76 @@ with tab3:
+     st.plotly_chart(fig3, width="stretch")
+ 
+ with tab4:
++    st.subheader("Historical performance: Gross vs. Net")
++    if gp_reported_gross_moic or gp_reported_gross_irr:
++        gpc1, gpc2 = st.columns(2)
++        with gpc1:
++            st.metric("Gross MOIC (GP-reported)", f"{gp_reported_gross_moic:.2f}x" if gp_reported_gross_moic else "n/a")
++            st.metric("Net MOIC (LP actual, to date)", f"{to_date.tvpi:.2f}x")
++        with gpc2:
++            st.metric("Gross IRR (GP-reported)", f"{gp_reported_gross_irr*100:.1f}%" if gp_reported_gross_irr else "n/a")
++            st.metric("Net IRR (LP actual, to date)", f"{to_date.irr*100:.1f}%" if to_date.irr == to_date.irr else "n/a")
++        st.caption(
++            "Gross figures are whatever the GP reports (entered in the sidebar) -- they aren't "
++            "derivable from the LP's own cash flows alone, since historical fee/carry cash flows "
++            "aren't tracked separately here. Net is the LP's own actual to-date performance, "
++            "computed the same way as the Overview tab."
++        )
++    else:
++        st.caption(
++            "Enter the GP's reported Gross MOIC/IRR in the sidebar (section 5) to see it "
++            "alongside the LP's actual Net figures here."
++        )
++
++    st.subheader("Return & timing analytics")
++    ac1, ac2, ac3 = st.columns(3)
++    ac1.metric("MV CAGR (projected growth)", f"{mv_cagr*100:.1f}%")
++    ac2.metric("Cash-flow duration", f"{cf_duration_years:.2f} yrs")
++    ac3.metric("RV / MV multiple", f"{rv_mv_multiple:.2f}x" if rv_mv_multiple else "n/a (aggregate mode)")
++    st.caption(
++        "MV CAGR: the flat annual rate that compounds the current net NAV to the projected "
++        "total value (all future distributions + any residual NAV) over the cash-flow "
++        "duration below -- a single-number growth-rate summary of the whole forecast. "
++        "Cash-flow duration: the distribution-weighted average time until money comes back. "
++        "RV/MV multiple: aggregate Reported Value over aggregate (diligence-adjusted) Market "
++        "Value across portfolio companies -- only shown in Portfolio companies mode, since "
++        "Aggregate NAV mode doesn't distinguish the two."
++    )
++    mc1, mc2 = st.columns(2)
++    mc1.metric("MOIC, unadjusted for CFs", f"{moic_unadjusted:.2f}x")
++    mc2.metric("MOIC, adjusted for CFs", f"{moic_adjusted:.2f}x")
++    st.caption(
++        "Unadjusted: TVPI, a point-in-time (distributions + NAV) / paid-in snapshot, blind to "
++        "when cash actually arrives. Adjusted: the seller (0%-discount) pricing scenario's "
++        "MOIC, which nets the net NAV purchase price against the actual projected LP "
++        "distributions (+ unfunded returns, if enabled) -- timing-aware, and a closer match "
++        "to what an XIRR-based buyer/seller conversation is really pricing."
++    )
++
++    st.subheader("Pricing bridge")
++    bridge_scenario = st.selectbox("Scenario", ["At Par (0% discount)", f"Buyer ({buyer_target_discount*100:.0f}% discount)"])
++    bridge_row = seller_row_for_moic if bridge_scenario.startswith("At Par") else buyer_row
++    reported_value = net_nav
++    market_value = net_nav  # net_nav is already the buyer's diligence-adjusted view where applicable (portfolio mode)
++    gross_exposure = market_value + total_unfunded
++    net_funded_exposure = market_value
++    net_effective_price = bridge_row["price"]
++    bridge_df = pd.DataFrame([
++        {"Step": "Reported Value (net of accrued carry)", "$": reported_value},
++        {"Step": "Market Value", "$": market_value},
++        {"Step": "+ Unfunded Commitment -> Gross Exposure", "$": gross_exposure},
++        {"Step": "Net Funded Exposure (Market Value, funded only)", "$": net_funded_exposure},
++        {"Step": f"Net Effective Price ({bridge_scenario})", "$": net_effective_price},
++    ])
++    st.dataframe(bridge_df.style.format({"$": "${:,.0f}"}), width="stretch", hide_index=True)
++    st.caption(
++        "A step-by-step view of how the net NAV becomes a purchase price: the buyer's "
++        "diligence-adjusted Market Value, grossed up for the unfunded commitment still to be "
++        "called (Gross Exposure), separated back out to the funded-only exposure, and finally "
++        "discounted (or not, for At Par) to the negotiated Net Effective Price."
++    )
++
++with tab5:
+     st.write("Ask the AI agent about this fund's metrics, forecast, or pricing.")
+     question = st.text_area("Question", placeholder="e.g. What discount to NAV is needed for a 20% IRR?")
+     if st.button("Ask") and question:
+diff --git a/finance_engine.py b/finance_engine.py
+index 64cf416..b97c1c1 100644
+--- a/finance_engine.py
++++ b/finance_engine.py
+@@ -308,6 +308,26 @@ def implied_annual_return(current_value: float, exit_value: float, years: int) -
+     return (exit_value / current_value) ** (1.0 / years) - 1.0
+ 
+ 
++def cash_flow_duration(forecast_rows: List[Dict], distribution_key: str, as_of: date) -> float:
++    """
++    Weighted-average time (in years) until the projected distributions arrive --
++    each year's distribution weighted by its distance from as_of, divided by total
++    distributions. A standard duration measure; a low number means cash comes back
++    fast, a high one means it's back-loaded. Returns 0.0 if there's nothing to weight
++    (no positive distributions in the forecast).
++    """
++    total = 0.0
++    weighted = 0.0
++    for row in forecast_rows:
++        amt = row.get(distribution_key, 0.0)
++        if amt <= 0:
++            continue
++        years = (row["date"] - as_of).days / 365.0
++        weighted += amt * years
++        total += amt
++    return weighted / total if total > 0 else 0.0
++
++
+ def reported_vs_market_value(reported_value: float, mv_adjustment: float) -> float:
+     """
+     Market Value = a buyer's own diligence-adjusted view of a holding's value,
+@@ -371,6 +391,66 @@ def apply_carry_waterfall(cf_dates: List[date], calls: List[float], distribution
+     return out
+ 
+ 
++def apply_carry_waterfall_declining_balance(paid_in_to_date: float, distributions_to_date: float,
++                                             forecast_rows: List[Dict], hurdle_rate: float,
++                                             carry_rate: float, gp_catchup_rate: float = 0.0) -> List[Dict]:
++    """
++    An alternative to apply_carry_waterfall() above, matching a declining-balance
++    hurdle mechanic some LPA waterfalls document instead of a single compounded
++    point-in-time threshold: both are legitimate European-waterfall formulations,
++    they just book the preferred return differently.
++
++    - Capital Base = paid-in capital still owed back to the LP as of the as-of date
++      (paid_in_to_date minus distributions_to_date, floored at 0). Distributions
++      already received pre-as-of-date are assumed to have already cleared their own
++      hurdle -- the same simplifying assumption apply_carry_waterfall makes.
++    - A Hurdle Balance rolls forward year by year: it GROWS each year by the
++      preferred return rate applied to itself (the balance still owed, like an
++      amortizing loan accruing interest), and SHRINKS as that year's distribution is
++      applied to it (capital, then preferred, in that priority) -- rather than being
++      compared against a single static compounded target the way apply_carry_waterfall
++      does.
++    - Once the Hurdle Balance hits zero (capital + all preferred paid back), carry
++      kicks in on distributions above the cumulative capital-plus-preferred line, at
++      carry_rate. gp_catchup_rate (0.0-1.0, default 0%) lets the GP catch up faster
++      once the hurdle clears, by reducing how much of the cumulative preferred return
++      is credited back to the LP side of the entitlement calc -- 0% (this
++      implementation's default, matching a template that had it turned off) means no
++      catch-up, a straight carry_rate split above the hurdle from the first dollar.
++
++    Returns rows shaped identically to apply_carry_waterfall's output (same keys,
++    'hurdle_threshold' repurposed to mean the remaining Hurdle Balance each year) so
++    it's a drop-in alternative wherever apply_carry_waterfall is used.
++    """
++    capital_base = max(0.0, paid_in_to_date - distributions_to_date)
++    hurdle_balance = capital_base
++    cum_dist = 0.0
++    cum_pref = 0.0
++    cum_carry_entitlement = 0.0
++    out = []
++    for row in forecast_rows:
++        g = row["gross_distribution"]
++        pref_accrued = hurdle_balance * hurdle_rate
++        applied = min(hurdle_balance + pref_accrued, g)
++        hurdle_balance = hurdle_balance + pref_accrued - applied
++        cum_dist += g
++        cum_pref += pref_accrued
++        if hurdle_balance <= 1e-6:
++            carry_cum_target = carry_rate * max(0.0, cum_dist - capital_base - (1 - gp_catchup_rate) * cum_pref)
++        else:
++            carry_cum_target = cum_carry_entitlement  # hurdle not cleared yet, no carry accrues
++        gp_amt = carry_cum_target - cum_carry_entitlement
++        cum_carry_entitlement = carry_cum_target
++        lp_amt = g - gp_amt
++        out.append({
++            **row,
++            "hurdle_threshold": hurdle_balance,
++            "lp_distribution": lp_amt,
++            "gp_carry": gp_amt,
++        })
++    return out
++
++
+ # ---------------------------------------------------------------------------
+ # Unfunded commitment (future capital calls the secondary buyer must fund)
+ # ---------------------------------------------------------------------------
+diff --git a/smoke_test_app.py b/smoke_test_app.py
+index 00272d3..a1bf190 100644
+--- a/smoke_test_app.py
++++ b/smoke_test_app.py
+@@ -85,6 +85,64 @@ def diff_lp_pct(at):
+ 
+ run_and_check("different LP commitment", diff_lp_pct)
+ 
++print("\n--- Declining-balance waterfall (with GP catch-up) ---")
++
++
++def to_declining_waterfall(at):
++    radios = [r for r in at.sidebar.radio]
++    wf = [r for r in radios if "hurdle balance" in str(r.options)]
++    assert wf, f"could not find waterfall-style radio among {[r.options for r in radios]}"
++    wf[0].set_value("Declining hurdle balance")
++
++
++run_and_check("declining-balance waterfall", to_declining_waterfall)
++
++
++def to_declining_waterfall_with_catchup(at):
++    to_declining_waterfall(at)
++    at.run()
++    sliders = [s for s in at.sidebar.slider]
++    catchup = [s for s in sliders if "GP catch-up" in s.label]
++    assert catchup, f"could not find GP catch-up slider among {[s.label for s in sliders]}"
++    catchup[0].set_value(50.0)
++
++
++run_and_check("declining-balance waterfall + 50% catch-up", to_declining_waterfall_with_catchup)
++
++print("\n--- Gross-reported performance inputs ---")
++
++
++def with_gross_reported(at):
++    ni = [n for n in at.sidebar.number_input]
++    for n in ni:
++        if n.label == "Gross MOIC (x)":
++            n.set_value(2.1)
++        if n.label == "Gross IRR (%)":
++            n.set_value(28.0)
++
++
++run_and_check("gross-reported MOIC/IRR shown in Analytics tab", with_gross_reported)
++
++print("\n--- Everything together: Fund/LP + EV/EBITDA + unfunded return + leverage + declining waterfall ---")
++
++
++def everything(at):
++    at.sidebar.radio[0].set_value("Portfolio companies (detailed)")
++    at.run()
++    radios = [r for r in at.sidebar.radio]
++    valuation_radio = [r for r in radios if "EV/EBITDA" in str(r.options)][0]
++    valuation_radio.set_value("Bottom-up EV/EBITDA model (detailed)")
++    wf = [r for r in radios if "hurdle balance" in str(r.options)][0]
++    wf.set_value("Declining hurdle balance")
++    for c in at.sidebar.checkbox:
++        if "generates its own return" in c.label:
++            c.set_value(True)
++        if "finances part of the purchase" in c.label:
++            c.set_value(True)
++
++
++run_and_check("everything combined", everything)
++
+ print("\n=== SUMMARY ===")
+ if FAILS:
+     print(f"{len(FAILS)} FAILED: {FAILS}")
+diff --git a/test_v3_features.py b/test_v3_features.py
+new file mode 100644
+index 0000000..20e39c6
+--- /dev/null
++++ b/test_v3_features.py
+@@ -0,0 +1,134 @@
++"""
++Independent verification of Round-2 additions:
++  1. apply_carry_waterfall_declining_balance() -- alternate European waterfall
++  2. cash_flow_duration() -- weighted-average distribution timing
++
++Each check recomputes the expected number by hand (a fresh loop, not by calling the
++function under test) and diffs against the real output. Run: python3 test_v3_features.py
++"""
++from datetime import date
++
++from finance_engine import apply_carry_waterfall_declining_balance, cash_flow_duration
++
++FAILS = []
++
++
++def check(name, cond, detail=""):
++    status = "PASS" if cond else "FAIL"
++    print(f"  [{status}] {name}" + (f"  ({detail})" if detail and not cond else ""))
++    if not cond:
++        FAILS.append(name)
++
++
++# ===========================================================================
++print("\n--- Declining-balance waterfall ---")
++# ===========================================================================
++# Hand-computable scenario: capital base $10M, hurdle 8%, carry 20%, no catch-up.
++# Year 1 distribution $3M (all applied to capital+pref, hurdle stays open).
++# Year 2 distribution $9M (clears the remaining hurdle balance, carry kicks in on
++# whatever crosses the line).
++# Year 3 distribution $5M (hurdle already clear from year 2 on, straight 80/20 split).
++forecast_rows = [
++    {"year": 1, "date": date(2027, 1, 1), "gross_distribution": 3_000_000.0},
++    {"year": 2, "date": date(2028, 1, 1), "gross_distribution": 9_000_000.0},
++    {"year": 3, "date": date(2029, 1, 1), "gross_distribution": 5_000_000.0},
++]
++paid_in_to_date = 10_000_000.0
++distributions_to_date = 0.0
++hurdle_rate = 0.08
++carry_rate = 0.20
++
++result = apply_carry_waterfall_declining_balance(paid_in_to_date, distributions_to_date,
++                                                   forecast_rows, hurdle_rate, carry_rate)
++
++# Manual, independent re-derivation:
++capital_base = 10_000_000.0
++hb = capital_base
++cum_dist = 0.0
++cum_pref = 0.0
++cum_carry = 0.0
++manual_rows = []
++for row in forecast_rows:
++    g = row["gross_distribution"]
++    pref = hb * hurdle_rate
++    applied = min(hb + pref, g)
++    hb = hb + pref - applied
++    cum_dist += g
++    cum_pref += pref
++    if hb <= 1e-6:
++        target = carry_rate * max(0.0, cum_dist - capital_base - cum_pref)
++    else:
++        target = cum_carry
++    gp = target - cum_carry
++    cum_carry = target
++    lp = g - gp
++    manual_rows.append({"hurdle_balance": hb, "lp": lp, "gp": gp})
++
++for i, (r, m) in enumerate(zip(result, manual_rows), start=1):
++    check(f"year {i} hurdle balance matches", abs(r["hurdle_threshold"] - m["hurdle_balance"]) < 1e-6,
++          (r["hurdle_threshold"], m["hurdle_balance"]))
++    check(f"year {i} LP distribution matches", abs(r["lp_distribution"] - m["lp"]) < 1e-6,
++          (r["lp_distribution"], m["lp"]))
++    check(f"year {i} GP carry matches", abs(r["gp_carry"] - m["gp"]) < 1e-6,
++          (r["gp_carry"], m["gp"]))
++    print(f"  year {i}: hurdle_balance={r['hurdle_threshold']:,.0f}  "
++          f"lp_dist={r['lp_distribution']:,.0f}  gp_carry={r['gp_carry']:,.0f}")
++
++# Sanity: total LP + GP must equal total gross distributed, every year.
++for i, r in enumerate(result, start=1):
++    total_g = forecast_rows[i - 1]["gross_distribution"]
++    check(f"year {i} LP+GP == gross distribution",
++          abs((r["lp_distribution"] + r["gp_carry"]) - total_g) < 1e-6)
++
++# Year 1: hurdle shouldn't have cleared yet (10M capital + 800k pref = 10.8M owed,
++# only 3M distributed) -> zero carry.
++check("year 1 carry is zero (hurdle nowhere near cleared)", result[0]["gp_carry"] == 0.0)
++# Year 3: hurdle already cleared in year 2, so year 3 should be a straight 80/20 split
++# of that year's $5M distribution (no capital/pref left to apply).
++check("year 3 is a straight 80/20 split once hurdle is clear",
++      abs(result[2]["lp_distribution"] - 5_000_000.0 * 0.8) < 1e-6 and
++      abs(result[2]["gp_carry"] - 5_000_000.0 * 0.2) < 1e-6,
++      (result[2]["lp_distribution"], result[2]["gp_carry"]))
++
++# Zero hurdle_rate, zero carry_rate edge case: LP should get 100% every year, no errors.
++result_zero = apply_carry_waterfall_declining_balance(10_000_000.0, 0.0, forecast_rows, 0.0, 0.0)
++check("0% hurdle / 0% carry -> LP gets everything",
++      all(r["gp_carry"] == 0.0 for r in result_zero) and
++      all(abs(r["lp_distribution"] - forecast_rows[i]["gross_distribution"]) < 1e-6
++          for i, r in enumerate(result_zero)))
++
++
++# ===========================================================================
++print("\n--- Cash-flow duration ---")
++# ===========================================================================
++as_of = date(2026, 1, 1)
++dur_rows = [
++    {"year": 1, "date": date(2027, 1, 1), "gross_distribution": 1_000_000.0},   # 1.0 yr out
++    {"year": 2, "date": date(2028, 1, 1), "gross_distribution": 1_000_000.0},   # 2.0 yr out
++    {"year": 3, "date": date(2029, 1, 1), "gross_distribution": 2_000_000.0},   # 3.0 yr out (approx, leap-adjusted)
++]
++dur = cash_flow_duration(dur_rows, "gross_distribution", as_of)
++# Manual: weighted = 1M*1 + 1M*2 + 2M*3(approx) ; total = 4M
++manual_weighted = sum(r["gross_distribution"] * (r["date"] - as_of).days / 365.0 for r in dur_rows)
++manual_total = sum(r["gross_distribution"] for r in dur_rows)
++manual_dur = manual_weighted / manual_total
++check("duration matches manual weighted-average calc", abs(dur - manual_dur) < 1e-9, (dur, manual_dur))
++# Sanity bounds: duration must lie between the earliest and latest cash flow's time.
++min_t = min((r["date"] - as_of).days / 365.0 for r in dur_rows)
++max_t = max((r["date"] - as_of).days / 365.0 for r in dur_rows)
++check("duration lies within [min_t, max_t]", min_t <= dur <= max_t, (min_t, dur, max_t))
++print(f"  duration = {dur:.3f} yrs (bounds [{min_t:.3f}, {max_t:.3f}])")
++
++# All-zero distributions -> 0.0, not a division error.
++dur_zero = cash_flow_duration([{"year": 1, "date": date(2027, 1, 1), "gross_distribution": 0.0}],
++                               "gross_distribution", as_of)
++check("all-zero distributions -> duration 0.0, no crash", dur_zero == 0.0)
++
++
++# ===========================================================================
++print("\n=== SUMMARY ===")
++if FAILS:
++    print(f"{len(FAILS)} CHECK(S) FAILED: {FAILS}")
++    raise SystemExit(1)
++else:
++    print("ALL CHECKS PASSED")
+-- 
+2.43.0
+
