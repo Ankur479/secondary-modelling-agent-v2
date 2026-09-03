@@ -139,8 +139,9 @@ else:
 # expected return, so its inputs have to be read before the fund-level forecast
 # runs. Streamlit lets a tab be written into at any point in the script, so the
 # remaining tabs are filled in further down, after the numbers exist.
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "Asset Model (Bottom-up)", "AI Assistant"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Overview", "Cash Flow Forecast", "Investments", "Secondary Pricing",
+     "Asset Model (Bottom-up)", "AI Assistant"]
 )
 
 # --------------------------------------------------------------------------
@@ -206,7 +207,7 @@ def _asset_state(aid, field):
     return st.session_state.get(f"am_{aid}_{field}", _asset_default(aid, field))
 
 
-with tab4:
+with tab5:
     st.subheader("Asset Model (Bottom-up)")
     if forecast_mode != "Portfolio companies (detailed)":
         st.info(
@@ -1083,7 +1084,169 @@ with tab2:
     )
     st.plotly_chart(fig2, width="stretch")
 
+# --------------------------------------------------------------------------
+# Investments -- the fund model's own two investment blocks, in its column order
+# --------------------------------------------------------------------------
 with tab3:
+    st.subheader("Investments")
+    if forecast_mode != "Portfolio companies (detailed)":
+        st.info(
+            "Switch **Forecast mode** to *Portfolio companies (detailed)* in the sidebar to see "
+            "the investment schedule. Aggregate NAV mode has no per-company detail to show."
+        )
+    else:
+        inv_years = [as_of.year + t for t in range(1, max(1, remaining_years) + 1)]
+        year_cols = [str(y) for y in inv_years]
+
+        def _inv_tables(records):
+            """Splits one investment block into its fund-level and LP-level views.
+
+            records: dicts with name, inv_date, cost, rv, mv_adj, mv, flows {year: $mm},
+            proceeds -- all fund level, in $mm. The LP view is the same schedule scaled by
+            the selling LP's ownership; MOIC is unchanged by that scaling, which is why the
+            fund and LP multiples agree.
+            """
+            tot_rv = sum(r["rv"] for r in records)
+            tot_mv = sum(r["mv"] for r in records)
+            fund_rows, lp_rows = [], []
+            for r in records:
+                fr = {
+                    "Company Name": r["name"], "Inv. Date": r["inv_date"],
+                    "% of RV": (r["rv"] / tot_rv) if tot_rv else 0.0,
+                    "% of MV": (r["mv"] / tot_mv) if tot_mv else 0.0,
+                    "Cost": r["cost"], "RV": r["rv"], "MV Adjustment": r["mv_adj"], "MV": r["mv"],
+                }
+                for y in inv_years:
+                    fr[str(y)] = r["flows"].get(y, 0.0)
+                fr["Proceeds"] = r["proceeds"]
+                fund_rows.append(fr)
+
+                lr = {
+                    "Company Name": r["name"], "Inv. Date": r["inv_date"],
+                    "LP Cost": r["cost"] * lp_pct, "LP RV": r["rv"] * lp_pct, "LP MV": r["mv"] * lp_pct,
+                }
+                for y in inv_years:
+                    lr[str(y)] = r["flows"].get(y, 0.0) * lp_pct
+                lr["LP Proceeds"] = r["proceeds"] * lp_pct
+                lr["LP MOIC"] = (r["proceeds"] / r["cost"]) if r["cost"] > 0 else None
+                lp_rows.append(lr)
+
+            if fund_rows:
+                tf = {"Company Name": "Total", "Inv. Date": "",
+                      "% of RV": sum(x["% of RV"] for x in fund_rows),
+                      "% of MV": sum(x["% of MV"] for x in fund_rows),
+                      "Cost": sum(x["Cost"] for x in fund_rows), "RV": sum(x["RV"] for x in fund_rows),
+                      "MV Adjustment": None, "MV": sum(x["MV"] for x in fund_rows)}
+                for c in year_cols:
+                    tf[c] = sum(x[c] for x in fund_rows)
+                tf["Proceeds"] = sum(x["Proceeds"] for x in fund_rows)
+                fund_rows.append(tf)
+
+                tl = {"Company Name": "Total", "Inv. Date": "",
+                      "LP Cost": sum(x["LP Cost"] for x in lp_rows),
+                      "LP RV": sum(x["LP RV"] for x in lp_rows),
+                      "LP MV": sum(x["LP MV"] for x in lp_rows)}
+                for c in year_cols:
+                    tl[c] = sum(x[c] for x in lp_rows)
+                tl["LP Proceeds"] = sum(x["LP Proceeds"] for x in lp_rows)
+                tl["LP MOIC"] = (tl["LP Proceeds"] / tl["LP Cost"]) if tl["LP Cost"] else None
+                lp_rows.append(tl)
+
+            return pd.DataFrame(fund_rows), pd.DataFrame(lp_rows)
+
+        def _show(fund_df, lp_df, key_prefix):
+            money = {c: "{:,.1f}" for c in year_cols}
+            with st.expander("Fund level", expanded=True):
+                if len(fund_df) == 0:
+                    st.caption("Nothing in this block yet.")
+                else:
+                    st.dataframe(
+                        fund_df.style.format({
+                            "% of RV": "{:.2%}", "% of MV": "{:.2%}", "MV Adjustment": "{:+.2%}",
+                            "Cost": "{:,.1f}", "RV": "{:,.1f}", "MV": "{:,.1f}",
+                            "Proceeds": "{:,.1f}", **money,
+                        }, na_rep=""),
+                        width="stretch", hide_index=True,
+                    )
+            with st.expander("LP level", expanded=False):
+                if len(lp_df) == 0:
+                    st.caption("Nothing in this block yet.")
+                else:
+                    st.dataframe(
+                        lp_df.style.format({
+                            "LP Cost": "{:,.2f}", "LP RV": "{:,.2f}", "LP MV": "{:,.2f}",
+                            "LP Proceeds": "{:,.2f}", "LP MOIC": "{:.2f}x", **money,
+                        }, na_rep=""),
+                        width="stretch", hide_index=True,
+                    )
+
+        st.caption(
+            f"All figures in $mm. Fund level is the whole fund; LP level is the selling LP's "
+            f"{lp_pct*100:.2f}% share of the same schedule. The year columns are each holding's "
+            "gross exit proceeds in that year, straight from its asset model."
+        )
+
+        st.markdown("### Current Investments")
+        current_records = []
+        for r in portfolio_rows:
+            am = asset_builds.get(r["Company"])
+            flows = {}
+            proceeds = 0.0
+            if am is not None:
+                flows = {c["year"]: c["exit_proceeds_to_fund"] for c in am["build"]["cash_flow_to_fund"]}
+                proceeds = am["build"]["gross_proceeds_to_fund"]
+            inv_d = r.get("Investment Date")
+            current_records.append({
+                "name": r["Company"],
+                "inv_date": inv_d.isoformat() if isinstance(inv_d, date) else str(inv_d),
+                "cost": float(r["Cost Basis ($M)"]), "rv": float(r["Reported Value ($M)"]),
+                "mv_adj": float(r["MV Adjustment (%)"]) / 100,
+                "mv": float(r["Reported Value ($M)"]) * (1 + float(r["MV Adjustment (%)"]) / 100),
+                "flows": flows, "proceeds": proceeds,
+            })
+        cur_fund, cur_lp = _inv_tables(current_records)
+        _show(cur_fund, cur_lp, "current")
+
+        st.markdown("### Post-Report Investments")
+        st.caption(
+            "Investments committed after the reporting date -- the known follow-ons from the "
+            "sidebar. Cost is drawn in the call year (shown negative), and the return lands "
+            "after the assumed hold period, at the assumed MOIC. Reported and Market Value are "
+            "held at cost, since a brand new position has no independent mark yet."
+        )
+        post_records = []
+        if known_followons_df is not None and len(known_followons_df) > 0:
+            for _, f in known_followons_df.iterrows():
+                try:
+                    amt = float(f["Amount ($M)"])
+                    call_year_rel = int(f["Year"])
+                except (TypeError, ValueError):
+                    continue
+                call_year = as_of.year + call_year_rel
+                flows = {call_year: -amt}
+                proceeds = 0.0
+                if unfunded_generates_return and unfunded_hold_years > 0:
+                    ret_year = call_year + int(unfunded_hold_years)
+                    if ret_year in inv_years:
+                        proceeds = amt * float(unfunded_moic)
+                        flows[ret_year] = flows.get(ret_year, 0.0) + proceeds
+                post_records.append({
+                    "name": str(f["Name"]), "inv_date": str(call_year),
+                    "cost": amt, "rv": amt, "mv_adj": 0.0, "mv": amt,
+                    "flows": flows, "proceeds": proceeds,
+                })
+        post_fund, post_lp = _inv_tables(post_records)
+        _show(post_fund, post_lp, "post")
+        if not post_records:
+            st.caption("No post-report investments entered (sidebar section 4).")
+        if blind_pool_amount > 0:
+            st.caption(
+                f"Separately, ${blind_pool_amount:,.0f} of blind-pool commitment (fund level) is "
+                f"drawn over {blind_pool_years} year(s). It isn't shown as a line here because it "
+                "isn't yet a named investment -- it flows through the Cash Flow Forecast instead."
+            )
+
+with tab4:
     st.subheader("Buyer vs. Seller")
     seller_row = secondary_pricing(net_nav, forecast_rows, as_of, [0.0], distribution_key,
                                     unfunded_calls, unfunded_returns)[0]
@@ -1254,7 +1417,7 @@ with tab1:
         "discounted (or not, for At Par) to the negotiated Net Effective Price."
     )
 
-with tab5:
+with tab6:
     st.write("Ask the AI agent about this fund's metrics, forecast, or pricing.")
     question = st.text_area("Question", placeholder="e.g. What discount to NAV is needed for a 20% IRR?")
     if st.button("Ask") and question:

@@ -1,38 +1,5 @@
-From a886e3801e736ac8edd263efd66fd209b3851aba Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
-Date: Thu, 3 Sep 2026 11:43:09 +0000
-Subject: [PATCH 1/2] Make Deal Snapshot editable: per-company inputs replace
- the sidebar portfolio table
-
-The portfolio table is gone from the sidebar. Every per-company input now lives in
-that company's own section in the Asset Model tab, Deal Snapshot included -- name,
-investment date, LP cost, reported value, MV adjustment and exit year -- with Market
-Value, % of Fund RV, hold period and the forecast year derived beside them. Phased-exit
-percentages and the fallback Expected Return sit behind a popover so the common case
-stays uncluttered. Companies are added and removed with a button.
-
-- Fund-level totals (aggregate reported NAV, forecast horizon) are computed from the
-  snapshots by reading session_state before the widgets are drawn, so an edit lands on
-  the same rerun instead of lagging a click behind.
-- Widget keys are stable ids, not company names, so renaming a company no longer resets
-  its whole model (covered by a test).
-- Sidebar sections 4-7 now render after the Asset Model tab, since their controls depend
-  on the forecast horizon, which is only known once every exit year has been read.
-- smoke_test_app.py gains four behavioural checks (edit RV -> fund NAV moves, edit exit
-  year -> horizon extends, add/remove a company, rename preserves the model). 16 checks
-  in total, all passing; every unit suite still passes and the headline numbers are
-  unchanged from before the restructure.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01767TxB9iBxKLrhvhPCK8Ct
----
- README.md         |  16 +-
- app.py            | 590 ++++++++++++++++++++++++++--------------------
- smoke_test_app.py |  58 +++++
- 3 files changed, 405 insertions(+), 259 deletions(-)
-
 diff --git a/README.md b/README.md
-index cdcace8..eec182c 100644
+index cdcace8..2663dca 100644
 --- a/README.md
 +++ b/README.md
 @@ -22,13 +22,15 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
@@ -58,8 +25,33 @@ index cdcace8..eec182c 100644
  8. **Leverage overlay** (optional) — model the buyer financing part of the purchase price with
     a subscription-line/NAV facility, shown alongside (never in place of) the unlevered return.
  9. **Declining-balance waterfall + Analytics & Pricing Bridge** (optional) — an alternate,
+@@ -36,7 +38,12 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
+    vs. the default compounded-threshold test), plus an analytics block (in the Overview tab)
+    covering Gross-vs-Net performance, MV CAGR, cash-flow duration, RV/MV multiple, and MOIC
+    adjusted vs. unadjusted for interim cash flows.
+-10. **Two-tier ("step-down") management fee** (optional, Portfolio companies mode) — mirrors a
++10. **Investments tab** — the fund model's two investment blocks, in its own column order:
++    Current Investments (Company Name, Inv. Date, % of RV, % of MV, Cost, RV, MV Adjustment, MV,
++    a column per forecast year, Proceeds) and Post-Report Investments below it, each with a
++    Fund-level and an LP-level dropdown. The LP view carries LP Cost / LP RV / LP MV / LP
++    Proceeds / LP MOIC — the same schedule at the selling LP's ownership.
++11. **Two-tier ("step-down") management fee** (optional, Portfolio companies mode) — mirrors a
+     common real fund schedule: a flat rate on the fund's total commitment during the investment
+     period, then from a chosen crossover year onward, a (usually lower) rate on each company's
+     remaining invested cost basis, which shrinks as companies exit. The default flat fee-on-NAV
+@@ -44,8 +51,8 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
+ 
+ ## Files
+ 
+-- `app.py` — Streamlit UI (5 tabs: Overview *(incl. Analytics & Pricing Bridge)*, Cash Flow
+-  Forecast, Secondary Pricing, Asset Model (Bottom-up), AI Assistant)
++- `app.py` — Streamlit UI (6 tabs: Overview *(incl. Analytics & Pricing Bridge)*, Cash Flow
++  Forecast, Investments, Secondary Pricing, Asset Model (Bottom-up), AI Assistant)
+ - `finance_engine.py` — core calculations (XIRR, runoff model, pricing sensitivity, waterfalls,
+   bottom-up asset model, two-tier management fee)
+ - `ai_agent.py` — AI agent wrapper (Claude + fallback)
 diff --git a/app.py b/app.py
-index 222d3f8..aa05170 100644
+index 222d3f8..33a13b4 100644
 --- a/app.py
 +++ b/app.py
 @@ -121,200 +121,15 @@ if forecast_mode == "Aggregate NAV (simple)":
@@ -105,12 +97,15 @@ index 222d3f8..aa05170 100644
 -        nav_current = 0.0
 -        remaining_years = 1
 -    st.sidebar.caption(f"Aggregate Reported NAV from portfolio: ${nav_current:,.0f}")
--    st.sidebar.caption(
+     st.sidebar.caption(
 -        "Add a row here and a full bottom-up model for that company appears in the "
 -        "**Asset Model (Bottom-up)** tab, where its operating build and exit valuation are "
 -        "set. Whatever each asset model projects drives that company's return here."
--    )
--
++        "Every per-company input -- cost, marks, exit timing and the full operating build -- "
++        "lives in the **Asset Model (Bottom-up)** tab, one section per company. Add or remove "
++        "companies there too."
+     )
+ 
 -st.sidebar.header("4. Unfunded commitment")
 -st.sidebar.write("Known follow-on investments (already identified):")
 -default_followons = pd.DataFrame([
@@ -248,25 +243,32 @@ index 222d3f8..aa05170 100644
 -if use_leverage:
 -    leverage_pct = st.sidebar.slider("Leverage (% of purchase price)", 0.0, 90.0, 40.0, step=5.0) / 100
 -    leverage_rate = st.sidebar.slider("Facility interest rate (%)", 0.0, 15.0, 6.5, step=0.25) / 100
-     st.sidebar.caption(
+-    st.sidebar.caption(
 -        "A subscription line / NAV facility funds this share of the purchase price at close. "
 -        "Available cash each year sweeps to interest then principal until the balance hits "
 -        "zero; the facility never funds unfunded capital calls, only the purchase itself."
-+        "Every per-company input -- cost, marks, exit timing and the full operating build -- "
-+        "lives in the **Asset Model (Bottom-up)** tab, one section per company. Add or remove "
-+        "companies there too."
-     )
+-    )
 -else:
 -    leverage_pct = 0.0
 -    leverage_rate = 0.0
- 
+-
 -st.sidebar.header("7. AI Agent")
 -api_key = st.sidebar.text_input("Anthropic API key (optional)", type="password")
 -st.sidebar.caption("No key? The assistant still answers using a rule-based summary of the numbers.")
  
  # --------------------------------------------------------------------------
  # Tabs
-@@ -331,15 +146,26 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
+@@ -324,22 +139,34 @@ st.sidebar.caption("No key? The assistant still answers using a rule-based summa
+ # expected return, so its inputs have to be read before the fund-level forecast
+ # runs. Streamlit lets a tab be written into at any point in the script, so the
+ # remaining tabs are filled in further down, after the numbers exist.
+-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+-    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "Asset Model (Bottom-up)", "AI Assistant"]
++tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
++    ["Overview", "Cash Flow Forecast", "Investments", "Secondary Pricing",
++     "Asset Model (Bottom-up)", "AI Assistant"]
+ )
+ 
  # --------------------------------------------------------------------------
  # Asset Model (Bottom-up) -- one full company model per portfolio holding
  # --------------------------------------------------------------------------
@@ -301,14 +303,15 @@ index 222d3f8..aa05170 100644
  }
  COMMON_DEFAULTS = {
      "entry_ebitda_margin": 25.0, "entry_ev_multiple": 11.0, "entry_net_debt_ebitda": 3.0,
-@@ -347,7 +173,38 @@ COMMON_DEFAULTS = {
+@@ -347,9 +174,40 @@ COMMON_DEFAULTS = {
      "ebitda_margin": 25.0, "fcf_conversion": 50.0,
  }
  
 -asset_builds = {}  # company name -> {"build": ..., "returns": ..., "drives_forecast": bool}
 +asset_builds = {}      # company name -> {"build": ..., "returns": ..., "drives_forecast": bool}
 +portfolio_rows = []    # the portfolio table, now assembled from each company's Deal Snapshot
-+
+ 
+-with tab4:
 +if forecast_mode == "Portfolio companies (detailed)":
 +    st.session_state.setdefault("asset_ids", list(ASSET_DEFAULTS.keys()))
 +    st.session_state.setdefault("asset_seq", 0)
@@ -338,10 +341,12 @@ index 222d3f8..aa05170 100644
 +    value -- which lets fund-level totals (NAV, horizon) be computed up front."""
 +    return st.session_state.get(f"am_{aid}_{field}", _asset_default(aid, field))
 +
- 
- with tab4:
++
++with tab5:
      st.subheader("Asset Model (Bottom-up)")
-@@ -357,93 +214,149 @@ with tab4:
+     if forecast_mode != "Portfolio companies (detailed)":
+         st.info(
+@@ -357,93 +215,149 @@ with tab4:
              "model each holding bottom-up. In Aggregate NAV mode the fund is projected off a "
              "single NAV and runoff curve instead, so there are no individual assets to build."
          )
@@ -541,7 +546,7 @@ index 222d3f8..aa05170 100644
                  )
  
                  st.markdown("**Operating Projections ($mm)**")
-@@ -458,7 +371,7 @@ with tab4:
+@@ -458,7 +372,7 @@ with tab4:
                      ]
                  )
                  ops_df = st.data_editor(
@@ -550,7 +555,7 @@ index 222d3f8..aa05170 100644
                      disabled=["Line item"],
                  )
  
-@@ -482,7 +395,7 @@ with tab4:
+@@ -482,7 +396,7 @@ with tab4:
                  st.markdown("**Exit Valuation**")
                  exit_ev_mult = st.number_input(
                      "Exit EV/EBITDA (x)", min_value=0.0, value=COMMON_DEFAULTS["exit_ev_multiple"],
@@ -559,7 +564,7 @@ index 222d3f8..aa05170 100644
                  )
  
                  build = asset_model_build(
-@@ -540,8 +453,9 @@ with tab4:
+@@ -540,8 +454,9 @@ with tab4:
  
                  st.markdown("**Returns & Tie-Out**")
                  prior_proceeds = st.number_input(
@@ -571,7 +576,7 @@ index 222d3f8..aa05170 100644
                      help="What this asset's proceeds were in the last version of the fund model "
                           "circulated. Kept as a hardcode so a re-run can be diffed against what "
                           "the client last saw. Set to 0 to ignore.",
-@@ -591,6 +505,178 @@ with tab4:
+@@ -591,6 +506,178 @@ with tab4:
                      "build": build, "returns": rets, "drives_forecast": drives,
                      "exit_cal_year": exit_cal, "hold_years": hold_years, "cost_m": cost_m, "rv_m": rv_m,
                  }
@@ -750,7 +755,7 @@ index 222d3f8..aa05170 100644
  
  # --------------------------------------------------------------------------
  # Core calculations
-@@ -618,7 +704,7 @@ if forecast_mode == "Aggregate NAV (simple)":
+@@ -618,7 +705,7 @@ if forecast_mode == "Aggregate NAV (simple)":
  else:
      companies = []
      portfolio_display_rows = []
@@ -759,168 +764,7 @@ index 222d3f8..aa05170 100644
          rv = float(row["Reported Value ($M)"]) * 1_000_000
          adj = float(row["MV Adjustment (%)"]) / 100
          mv = reported_vs_market_value(rv, adj)
-diff --git a/smoke_test_app.py b/smoke_test_app.py
-index 9a6cec8..eda01c4 100644
---- a/smoke_test_app.py
-+++ b/smoke_test_app.py
-@@ -168,6 +168,64 @@ def everything(at):
- 
- run_and_check("everything combined", everything)
- 
-+print("\n--- Deal Snapshot editing, add/remove, rename (behaviour, not just 'no crash') ---")
-+
-+
-+def _portfolio_app():
-+    at = AppTest.from_file("app.py", default_timeout=30)
-+    at.run()
-+    at.sidebar.radio[0].set_value("Portfolio companies (detailed)")
-+    at.run()
-+    return at
-+
-+
-+def _metric(at, label):
-+    hits = [m.value for m in at.metric if m.label == label]
-+    assert hits, f"metric {label!r} not found"
-+    return hits[0]
-+
-+
-+def _check(label, cond, detail=""):
-+    if cond:
-+        print(f"  [PASS] {label}")
-+    else:
-+        print(f"  [FAIL] {label}  {detail}")
-+        FAILS.append(label)
-+
-+
-+at = _portfolio_app()
-+nav_before = _metric(at, "Aggregate Reported Value")
-+rv_input = [n for n in at.number_input if n.label == "Reported Value (RV, $mm)"][0]
-+rv_input.set_value(200.0)
-+at.run()
-+_check("editing a company's Reported Value moves fund NAV on the same rerun",
-+       _metric(at, "Aggregate Reported Value") == "$669,300,000",
-+       f"{nav_before} -> {_metric(at, 'Aggregate Reported Value')}")
-+
-+at = _portfolio_app()
-+exit_input = [n for n in at.number_input if n.label == "Exit Year"][0]
-+exit_input.set_value(2035)
-+at.run()
-+_check("editing a company's Exit Year extends the forecast horizon",
-+       _metric(at, "Forecast horizon").startswith("10 yrs"), _metric(at, "Forecast horizon"))
-+
-+at = _portfolio_app()
-+[b for b in at.button if "Add a company" in b.label][0].click()
-+at.run()
-+added = _metric(at, "Companies")
-+[b for b in at.button if b.label == "Remove"][0].click()
-+at.run()
-+_check("add / remove a company", added == "6" and _metric(at, "Companies") == "5",
-+       f"after add={added}, after remove={_metric(at, 'Companies')}")
-+
-+at = _portfolio_app()
-+moic_before = _metric(at, "Gross MOIC (vs Cost)")
-+[t for t in at.text_input if t.label == "Company"][0].set_value("Project Falcon")
-+at.run()
-+_check("renaming a company keeps its model intact (stable widget ids)",
-+       _metric(at, "Gross MOIC (vs Cost)") == moic_before,
-+       f"{moic_before} -> {_metric(at, 'Gross MOIC (vs Cost)')}")
-+
- print("\n=== SUMMARY ===")
- if FAILS:
-     print(f"{len(FAILS)} FAILED: {FAILS}")
--- 
-2.43.0
-
-
-From af801584ddaf785408792c887d5701f514b0fb59 Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
-Date: Thu, 3 Sep 2026 16:36:35 +0000
-Subject: [PATCH 2/2] Add Investments tab: Current and Post-Report blocks,
- fund-level and LP-level views
-
-New tab between Cash Flow Forecast and Secondary Pricing, reproducing the fund model's
-own two investment blocks in its column order:
-
-- Current Investments: Company Name, Inv. Date, % of RV, % of MV, Cost, RV, MV Adjustment,
-  MV, one column per forecast year, Proceeds -- with a Total row. The year columns are each
-  holding's gross exit proceeds straight from its asset model, so this block and the Asset
-  Model tab can never disagree.
-- Post-Report Investments: the known follow-ons, held at cost (RV = MV = Cost, as a brand new
-  position has no independent mark), the draw shown as an outflow in its call year and the
-  return landing after the assumed hold at the assumed MOIC. The blind pool is called out in
-  a note rather than shown as a line, since it isn't a named investment yet.
-- Each block has a Fund level and an LP level dropdown. The LP view carries LP Cost / LP RV /
-  LP MV / LP Proceeds / LP MOIC over the same year columns, scaled by the selling LP's
-  ownership; MOIC is scale-invariant, so the two levels agree by construction.
-
-Verified against the source workbook: % of RV (Asset A 28.6019%), total cost $426.4mm, total
-RV $657.3mm, per-company proceeds (Asset A 238.106358) and LP MOIC (3.0923x) all tie out.
-14 new smoke checks pin the column order and those figures; 30 checks in total pass, along
-with every unit suite.
-
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01767TxB9iBxKLrhvhPCK8Ct
----
- README.md         |  11 ++-
- app.py            | 171 ++++++++++++++++++++++++++++++++++++++++++++--
- smoke_test_app.py |  54 +++++++++++++++
- 3 files changed, 229 insertions(+), 7 deletions(-)
-
-diff --git a/README.md b/README.md
-index eec182c..2663dca 100644
---- a/README.md
-+++ b/README.md
-@@ -38,7 +38,12 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
-    vs. the default compounded-threshold test), plus an analytics block (in the Overview tab)
-    covering Gross-vs-Net performance, MV CAGR, cash-flow duration, RV/MV multiple, and MOIC
-    adjusted vs. unadjusted for interim cash flows.
--10. **Two-tier ("step-down") management fee** (optional, Portfolio companies mode) — mirrors a
-+10. **Investments tab** — the fund model's two investment blocks, in its own column order:
-+    Current Investments (Company Name, Inv. Date, % of RV, % of MV, Cost, RV, MV Adjustment, MV,
-+    a column per forecast year, Proceeds) and Post-Report Investments below it, each with a
-+    Fund-level and an LP-level dropdown. The LP view carries LP Cost / LP RV / LP MV / LP
-+    Proceeds / LP MOIC — the same schedule at the selling LP's ownership.
-+11. **Two-tier ("step-down") management fee** (optional, Portfolio companies mode) — mirrors a
-     common real fund schedule: a flat rate on the fund's total commitment during the investment
-     period, then from a chosen crossover year onward, a (usually lower) rate on each company's
-     remaining invested cost basis, which shrinks as companies exit. The default flat fee-on-NAV
-@@ -46,8 +51,8 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
- 
- ## Files
- 
--- `app.py` — Streamlit UI (5 tabs: Overview *(incl. Analytics & Pricing Bridge)*, Cash Flow
--  Forecast, Secondary Pricing, Asset Model (Bottom-up), AI Assistant)
-+- `app.py` — Streamlit UI (6 tabs: Overview *(incl. Analytics & Pricing Bridge)*, Cash Flow
-+  Forecast, Investments, Secondary Pricing, Asset Model (Bottom-up), AI Assistant)
- - `finance_engine.py` — core calculations (XIRR, runoff model, pricing sensitivity, waterfalls,
-   bottom-up asset model, two-tier management fee)
- - `ai_agent.py` — AI agent wrapper (Claude + fallback)
-diff --git a/app.py b/app.py
-index aa05170..33a13b4 100644
---- a/app.py
-+++ b/app.py
-@@ -139,8 +139,9 @@ else:
- # expected return, so its inputs have to be read before the fund-level forecast
- # runs. Streamlit lets a tab be written into at any point in the script, so the
- # remaining tabs are filled in further down, after the numbers exist.
--tab1, tab2, tab3, tab4, tab5 = st.tabs(
--    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "Asset Model (Bottom-up)", "AI Assistant"]
-+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-+    ["Overview", "Cash Flow Forecast", "Investments", "Secondary Pricing",
-+     "Asset Model (Bottom-up)", "AI Assistant"]
- )
- 
- # --------------------------------------------------------------------------
-@@ -206,7 +207,7 @@ def _asset_state(aid, field):
-     return st.session_state.get(f"am_{aid}_{field}", _asset_default(aid, field))
- 
- 
--with tab4:
-+with tab5:
-     st.subheader("Asset Model (Bottom-up)")
-     if forecast_mode != "Portfolio companies (detailed)":
-         st.info(
-@@ -1083,7 +1084,169 @@ with tab2:
+@@ -997,7 +1084,169 @@ with tab2:
      )
      st.plotly_chart(fig2, width="stretch")
  
@@ -1090,7 +934,7 @@ index aa05170..33a13b4 100644
      st.subheader("Buyer vs. Seller")
      seller_row = secondary_pricing(net_nav, forecast_rows, as_of, [0.0], distribution_key,
                                      unfunded_calls, unfunded_returns)[0]
-@@ -1254,7 +1417,7 @@ with tab1:
+@@ -1168,7 +1417,7 @@ with tab1:
          "discounted (or not, for At Par) to the negotiated Net Effective Price."
      )
  
@@ -1100,13 +944,71 @@ index aa05170..33a13b4 100644
      question = st.text_area("Question", placeholder="e.g. What discount to NAV is needed for a 20% IRR?")
      if st.button("Ask") and question:
 diff --git a/smoke_test_app.py b/smoke_test_app.py
-index eda01c4..82e54a8 100644
+index 9a6cec8..82e54a8 100644
 --- a/smoke_test_app.py
 +++ b/smoke_test_app.py
-@@ -226,6 +226,60 @@ _check("renaming a company keeps its model intact (stable widget ids)",
-        _metric(at, "Gross MOIC (vs Cost)") == moic_before,
-        f"{moic_before} -> {_metric(at, 'Gross MOIC (vs Cost)')}")
+@@ -168,6 +168,118 @@ def everything(at):
  
+ run_and_check("everything combined", everything)
+ 
++print("\n--- Deal Snapshot editing, add/remove, rename (behaviour, not just 'no crash') ---")
++
++
++def _portfolio_app():
++    at = AppTest.from_file("app.py", default_timeout=30)
++    at.run()
++    at.sidebar.radio[0].set_value("Portfolio companies (detailed)")
++    at.run()
++    return at
++
++
++def _metric(at, label):
++    hits = [m.value for m in at.metric if m.label == label]
++    assert hits, f"metric {label!r} not found"
++    return hits[0]
++
++
++def _check(label, cond, detail=""):
++    if cond:
++        print(f"  [PASS] {label}")
++    else:
++        print(f"  [FAIL] {label}  {detail}")
++        FAILS.append(label)
++
++
++at = _portfolio_app()
++nav_before = _metric(at, "Aggregate Reported Value")
++rv_input = [n for n in at.number_input if n.label == "Reported Value (RV, $mm)"][0]
++rv_input.set_value(200.0)
++at.run()
++_check("editing a company's Reported Value moves fund NAV on the same rerun",
++       _metric(at, "Aggregate Reported Value") == "$669,300,000",
++       f"{nav_before} -> {_metric(at, 'Aggregate Reported Value')}")
++
++at = _portfolio_app()
++exit_input = [n for n in at.number_input if n.label == "Exit Year"][0]
++exit_input.set_value(2035)
++at.run()
++_check("editing a company's Exit Year extends the forecast horizon",
++       _metric(at, "Forecast horizon").startswith("10 yrs"), _metric(at, "Forecast horizon"))
++
++at = _portfolio_app()
++[b for b in at.button if "Add a company" in b.label][0].click()
++at.run()
++added = _metric(at, "Companies")
++[b for b in at.button if b.label == "Remove"][0].click()
++at.run()
++_check("add / remove a company", added == "6" and _metric(at, "Companies") == "5",
++       f"after add={added}, after remove={_metric(at, 'Companies')}")
++
++at = _portfolio_app()
++moic_before = _metric(at, "Gross MOIC (vs Cost)")
++[t for t in at.text_input if t.label == "Company"][0].set_value("Project Falcon")
++at.run()
++_check("renaming a company keeps its model intact (stable widget ids)",
++       _metric(at, "Gross MOIC (vs Cost)") == moic_before,
++       f"{moic_before} -> {_metric(at, 'Gross MOIC (vs Cost)')}")
++
 +print("\n--- Investments tab: column order and fund/LP tie-out ---")
 +
 +at = _portfolio_app()
@@ -1164,6 +1066,3 @@ index eda01c4..82e54a8 100644
  print("\n=== SUMMARY ===")
  if FAILS:
      print(f"{len(FAILS)} FAILED: {FAILS}")
--- 
-2.43.0
-

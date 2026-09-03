@@ -38,7 +38,12 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
    vs. the default compounded-threshold test), plus an analytics block (in the Overview tab)
    covering Gross-vs-Net performance, MV CAGR, cash-flow duration, RV/MV multiple, and MOIC
    adjusted vs. unadjusted for interim cash flows.
-10. **Two-tier ("step-down") management fee** (optional, Portfolio companies mode) — mirrors a
+10. **Investments tab** — the fund model's two investment blocks, in its own column order:
+    Current Investments (Company Name, Inv. Date, % of RV, % of MV, Cost, RV, MV Adjustment, MV,
+    a column per forecast year, Proceeds) and Post-Report Investments below it, each with a
+    Fund-level and an LP-level dropdown. The LP view carries LP Cost / LP RV / LP MV / LP
+    Proceeds / LP MOIC — the same schedule at the selling LP's ownership.
+11. **Two-tier ("step-down") management fee** (optional, Portfolio companies mode) — mirrors a
     common real fund schedule: a flat rate on the fund's total commitment during the investment
     period, then from a chosen crossover year onward, a (usually lower) rate on each company's
     remaining invested cost basis, which shrinks as companies exit. The default flat fee-on-NAV
@@ -46,8 +51,8 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
 
 ## Files
 
-- `app.py` — Streamlit UI (5 tabs: Overview *(incl. Analytics & Pricing Bridge)*, Cash Flow
-  Forecast, Secondary Pricing, Asset Model (Bottom-up), AI Assistant)
+- `app.py` — Streamlit UI (6 tabs: Overview *(incl. Analytics & Pricing Bridge)*, Cash Flow
+  Forecast, Investments, Secondary Pricing, Asset Model (Bottom-up), AI Assistant)
 - `finance_engine.py` — core calculations (XIRR, runoff model, pricing sensitivity, waterfalls,
   bottom-up asset model, two-tier management fee)
 - `ai_agent.py` — AI agent wrapper (Claude + fallback)

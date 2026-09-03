@@ -226,6 +226,60 @@ _check("renaming a company keeps its model intact (stable widget ids)",
        _metric(at, "Gross MOIC (vs Cost)") == moic_before,
        f"{moic_before} -> {_metric(at, 'Gross MOIC (vs Cost)')}")
 
+print("\n--- Investments tab: column order and fund/LP tie-out ---")
+
+at = _portfolio_app()
+tables = {}
+for d in at.dataframe:
+    cols = list(d.value.columns)
+    if "Company Name" in cols:
+        kind = "fund" if "% of RV" in cols else "lp"
+        tables.setdefault(kind, []).append(d.value)
+
+_check("both a fund-level and an LP-level table render",
+       len(tables.get("fund", [])) >= 2 and len(tables.get("lp", [])) >= 2,
+       f"fund={len(tables.get('fund', []))} lp={len(tables.get('lp', []))}")
+
+if tables.get("fund"):
+    cur_fund = tables["fund"][0]
+    head = list(cur_fund.columns)[:8]
+    _check("fund columns follow the workbook's order",
+           head == ["Company Name", "Inv. Date", "% of RV", "% of MV", "Cost", "RV",
+                    "MV Adjustment", "MV"], head)
+    _check("last fund column is Proceeds", list(cur_fund.columns)[-1] == "Proceeds",
+           list(cur_fund.columns)[-1])
+    total = cur_fund[cur_fund["Company Name"] == "Total"].iloc[0]
+    _check("Current Investments total cost ties to the deal ($426.4mm)",
+           abs(float(total["Cost"]) - 426.4) < 0.05, total["Cost"])
+    _check("Current Investments total RV ties to fund NAV ($657.3mm)",
+           abs(float(total["RV"]) - 657.3) < 0.05, total["RV"])
+    _check("% of RV sums to 100%", abs(float(total["% of RV"]) - 1.0) < 1e-9, total["% of RV"])
+    a_row = cur_fund[cur_fund["Company Name"] == "Asset A"].iloc[0]
+    _check("Asset A proceeds match its asset model (238.106358)",
+           abs(float(a_row["Proceeds"]) - 238.106358) < 1e-5, a_row["Proceeds"])
+
+if tables.get("lp"):
+    cur_lp = tables["lp"][0]
+    head = list(cur_lp.columns)[:5]
+    _check("LP columns follow the workbook's order",
+           head == ["Company Name", "Inv. Date", "LP Cost", "LP RV", "LP MV"], head)
+    _check("last LP columns are Proceeds then MOIC",
+           list(cur_lp.columns)[-2:] == ["LP Proceeds", "LP MOIC"], list(cur_lp.columns)[-2:])
+    a_lp = cur_lp[cur_lp["Company Name"] == "Asset A"].iloc[0]
+    _check("LP MOIC is scale-invariant (matches the fund's 3.0923x)",
+           abs(float(a_lp["LP MOIC"]) - 3.09229036363636) < 1e-6, a_lp["LP MOIC"])
+    _check("LP RV total is the LP's share of fund NAV",
+           abs(float(cur_lp[cur_lp["Company Name"] == "Total"].iloc[0]["LP RV"]) - 21.700552) < 1e-3,
+           cur_lp[cur_lp["Company Name"] == "Total"].iloc[0]["LP RV"])
+
+if len(tables.get("fund", [])) >= 2:
+    post = tables["fund"][1]
+    f_row = post.iloc[0]
+    _check("post-report investment shows its draw as an outflow in the call year",
+           float(f_row["2026"]) == -90.0, f_row["2026"])
+    _check("post-report proceeds land at the assumed MOIC (90 x 1.75)",
+           abs(float(f_row["Proceeds"]) - 157.5) < 1e-6, f_row["Proceeds"])
+
 print("\n=== SUMMARY ===")
 if FAILS:
     print(f"{len(FAILS)} FAILED: {FAILS}")
