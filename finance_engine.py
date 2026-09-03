@@ -308,6 +308,26 @@ def implied_annual_return(current_value: float, exit_value: float, years: int) -
     return (exit_value / current_value) ** (1.0 / years) - 1.0
 
 
+def cash_flow_duration(forecast_rows: List[Dict], distribution_key: str, as_of: date) -> float:
+    """
+    Weighted-average time (in years) until the projected distributions arrive --
+    each year's distribution weighted by its distance from as_of, divided by total
+    distributions. A standard duration measure; a low number means cash comes back
+    fast, a high one means it's back-loaded. Returns 0.0 if there's nothing to weight
+    (no positive distributions in the forecast).
+    """
+    total = 0.0
+    weighted = 0.0
+    for row in forecast_rows:
+        amt = row.get(distribution_key, 0.0)
+        if amt <= 0:
+            continue
+        years = (row["date"] - as_of).days / 365.0
+        weighted += amt * years
+        total += amt
+    return weighted / total if total > 0 else 0.0
+
+
 def reported_vs_market_value(reported_value: float, mv_adjustment: float) -> float:
     """
     Market Value = a buyer's own diligence-adjusted view of a holding's value,
@@ -365,6 +385,66 @@ def apply_carry_waterfall(cf_dates: List[date], calls: List[float], distribution
         out.append({
             **row,
             "hurdle_threshold": threshold,
+            "lp_distribution": lp_amt,
+            "gp_carry": gp_amt,
+        })
+    return out
+
+
+def apply_carry_waterfall_declining_balance(paid_in_to_date: float, distributions_to_date: float,
+                                             forecast_rows: List[Dict], hurdle_rate: float,
+                                             carry_rate: float, gp_catchup_rate: float = 0.0) -> List[Dict]:
+    """
+    An alternative to apply_carry_waterfall() above, matching a declining-balance
+    hurdle mechanic some LPA waterfalls document instead of a single compounded
+    point-in-time threshold: both are legitimate European-waterfall formulations,
+    they just book the preferred return differently.
+
+    - Capital Base = paid-in capital still owed back to the LP as of the as-of date
+      (paid_in_to_date minus distributions_to_date, floored at 0). Distributions
+      already received pre-as-of-date are assumed to have already cleared their own
+      hurdle -- the same simplifying assumption apply_carry_waterfall makes.
+    - A Hurdle Balance rolls forward year by year: it GROWS each year by the
+      preferred return rate applied to itself (the balance still owed, like an
+      amortizing loan accruing interest), and SHRINKS as that year's distribution is
+      applied to it (capital, then preferred, in that priority) -- rather than being
+      compared against a single static compounded target the way apply_carry_waterfall
+      does.
+    - Once the Hurdle Balance hits zero (capital + all preferred paid back), carry
+      kicks in on distributions above the cumulative capital-plus-preferred line, at
+      carry_rate. gp_catchup_rate (0.0-1.0, default 0%) lets the GP catch up faster
+      once the hurdle clears, by reducing how much of the cumulative preferred return
+      is credited back to the LP side of the entitlement calc -- 0% (this
+      implementation's default, matching a template that had it turned off) means no
+      catch-up, a straight carry_rate split above the hurdle from the first dollar.
+
+    Returns rows shaped identically to apply_carry_waterfall's output (same keys,
+    'hurdle_threshold' repurposed to mean the remaining Hurdle Balance each year) so
+    it's a drop-in alternative wherever apply_carry_waterfall is used.
+    """
+    capital_base = max(0.0, paid_in_to_date - distributions_to_date)
+    hurdle_balance = capital_base
+    cum_dist = 0.0
+    cum_pref = 0.0
+    cum_carry_entitlement = 0.0
+    out = []
+    for row in forecast_rows:
+        g = row["gross_distribution"]
+        pref_accrued = hurdle_balance * hurdle_rate
+        applied = min(hurdle_balance + pref_accrued, g)
+        hurdle_balance = hurdle_balance + pref_accrued - applied
+        cum_dist += g
+        cum_pref += pref_accrued
+        if hurdle_balance <= 1e-6:
+            carry_cum_target = carry_rate * max(0.0, cum_dist - capital_base - (1 - gp_catchup_rate) * cum_pref)
+        else:
+            carry_cum_target = cum_carry_entitlement  # hurdle not cleared yet, no carry accrues
+        gp_amt = carry_cum_target - cum_carry_entitlement
+        cum_carry_entitlement = carry_cum_target
+        lp_amt = g - gp_amt
+        out.append({
+            **row,
+            "hurdle_threshold": hurdle_balance,
             "lp_distribution": lp_amt,
             "gp_carry": gp_amt,
         })

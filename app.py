@@ -15,8 +15,10 @@ import streamlit as st
 from ai_agent import ask_agent
 from finance_engine import (
     apply_carry_waterfall,
+    apply_carry_waterfall_declining_balance,
     build_unfunded_returns,
     build_unfunded_schedule,
+    cash_flow_duration,
     ebitda_exit_value,
     forecast_cashflows,
     forecast_from_portfolio,
@@ -239,6 +241,33 @@ accrued_carry = st.sidebar.number_input(
          "reduces the net value actually available to the LP, separate from carry the "
          "waterfall above computes on future distributions."
 )
+waterfall_style = st.sidebar.radio(
+    "Waterfall style", ["Compounded threshold (default)", "Declining hurdle balance"], index=0,
+    help="Both are legitimate European waterfalls, they just book the preferred return "
+         "differently. Compounded threshold: distributions compare against a single "
+         "target (all historical calls compounded to today at the hurdle rate) -- once "
+         "cumulative LP distributions cross it, carry kicks in. Declining hurdle "
+         "balance: a running balance (starting at unreturned paid-in capital) accrues "
+         "the hurdle rate on itself and shrinks as distributions are applied to it; "
+         "carry kicks in once that balance hits zero.",
+)
+gp_catchup_rate = 0.0
+if waterfall_style == "Declining hurdle balance":
+    gp_catchup_rate = st.sidebar.slider(
+        "GP catch-up (%, 0 = none)", 0.0, 100.0, 0.0, step=5.0,
+        help="Not the carry rate -- this only controls how fast the GP catches up to "
+             "the full carry_rate split once the hurdle clears. 0% (default) means a "
+             "straight carry_rate split from the first post-hurdle dollar.",
+    ) / 100
+
+st.sidebar.write("GP-reported Gross performance to date (optional -- shown next to the LP's actual Net figures):")
+gpc1, gpc2 = st.sidebar.columns(2)
+gp_reported_gross_moic = gpc1.number_input("Gross MOIC (x)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
+gp_reported_gross_irr = gpc2.number_input("Gross IRR (%)", min_value=0.0, value=0.0, step=0.5, format="%.1f") / 100
+st.sidebar.caption(
+    "Gross (before fees/carry) performance isn't derivable from the LP's own cash flows -- "
+    "it's whatever the GP reports. Leave at 0 to hide the comparison."
+)
 
 st.sidebar.header("6. Leverage (optional)")
 use_leverage = st.sidebar.checkbox("Buyer finances part of the purchase with a facility", value=False)
@@ -338,9 +367,14 @@ else:
     portfolio_display = pd.DataFrame(portfolio_display_rows)
 
 if apply_fees:
-    forecast_rows = apply_carry_waterfall(
-        cf_dates, calls_lp, to_date.distributions, forecast_rows, hurdle_rate, carry_rate
-    )
+    if waterfall_style == "Declining hurdle balance":
+        forecast_rows = apply_carry_waterfall_declining_balance(
+            to_date.paid_in, to_date.distributions, forecast_rows, hurdle_rate, carry_rate, gp_catchup_rate
+        )
+    else:
+        forecast_rows = apply_carry_waterfall(
+            cf_dates, calls_lp, to_date.distributions, forecast_rows, hurdle_rate, carry_rate
+        )
     distribution_key = "lp_distribution"
 else:
     distribution_key = "gross_distribution"
@@ -376,6 +410,28 @@ if use_leverage and leverage_pct > 0:
         buyer_row, forecast_rows, as_of, distribution_key, unfunded_calls, leverage_pct, leverage_rate,
         unfunded_returns,
     )
+
+# --------------------------------------------------------------------------
+# Analytics: MV CAGR, cash-flow duration, RV/MV multiple, MOIC adjusted for CFs
+# --------------------------------------------------------------------------
+cf_duration_years = cash_flow_duration(forecast_rows, distribution_key, as_of)
+terminal_value = sum(r[distribution_key] for r in forecast_rows) + (forecast_rows[-1]["ending_nav"] if forecast_rows else 0.0)
+mv_cagr = implied_annual_return(net_nav, terminal_value, cf_duration_years) if cf_duration_years > 0 else 0.0
+
+rv_mv_multiple = None
+if portfolio_display is not None and len(portfolio_display) > 0:
+    rv_total = portfolio_display["Reported Value (Fund)"].sum()
+    mv_total = portfolio_display["Market Value (Fund)"].sum()
+    rv_mv_multiple = rv_total / mv_total if mv_total else None
+
+# "Unadjusted for CFs" = the raw hold-at-par TVPI already computed to date; "adjusted"
+# = the seller (0%-discount) pricing scenario's MOIC, which nets the purchase price
+# against actual projected LP distributions + unfunded returns -- i.e. time/cash-flow
+# aware, vs. TVPI's simple point-in-time snapshot.
+seller_row_for_moic = secondary_pricing(net_nav, forecast_rows, as_of, [0.0], distribution_key,
+                                         unfunded_calls, unfunded_returns)[0]
+moic_unadjusted = to_date.tvpi
+moic_adjusted = seller_row_for_moic["moic"]
 
 metrics_context = {
     "fund_lp": {
@@ -431,13 +487,26 @@ metrics_context = {
         "initial_draw": leverage_result["initial_draw"] if leverage_result else None,
         "equity_invested": leverage_result["equity_invested"] if leverage_result else None,
     } if use_leverage else None,
+    "analytics": {
+        "waterfall_style": waterfall_style,
+        "gp_catchup_rate": gp_catchup_rate,
+        "gross_moic_reported": gp_reported_gross_moic or None,
+        "gross_irr_reported": gp_reported_gross_irr or None,
+        "net_moic_to_date": to_date.tvpi,
+        "net_irr_to_date": to_date.irr,
+        "mv_cagr": mv_cagr,
+        "cash_flow_duration_years": cf_duration_years,
+        "rv_mv_multiple": rv_mv_multiple,
+        "moic_unadjusted_for_cfs": moic_unadjusted,
+        "moic_adjusted_for_cfs": moic_adjusted,
+    },
 }
 
 # --------------------------------------------------------------------------
 # Tabs
 # --------------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "AI Assistant"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "Analytics & Pricing Bridge", "AI Assistant"]
 )
 
 with tab1:
@@ -495,6 +564,15 @@ with tab2:
                         f"implied return is what compounds the company's LP-level current Market "
                         f"Value to that LP-level exit proceeds by the exit year."
                     )
+                    sched_df = pd.DataFrame(d["schedule"])
+                    st.dataframe(
+                        sched_df.style.format({
+                            "revenue": "${:,.0f}", "ebitda": "${:,.0f}", "fcf": "${:,.0f}",
+                            "beginning_net_debt": "${:,.0f}", "ending_net_debt": "${:,.0f}",
+                        }),
+                        width="stretch", hide_index=True,
+                    )
+                    st.divider()
 
     fdf = pd.DataFrame(forecast_rows)
 
@@ -671,6 +749,76 @@ with tab3:
     st.plotly_chart(fig3, width="stretch")
 
 with tab4:
+    st.subheader("Historical performance: Gross vs. Net")
+    if gp_reported_gross_moic or gp_reported_gross_irr:
+        gpc1, gpc2 = st.columns(2)
+        with gpc1:
+            st.metric("Gross MOIC (GP-reported)", f"{gp_reported_gross_moic:.2f}x" if gp_reported_gross_moic else "n/a")
+            st.metric("Net MOIC (LP actual, to date)", f"{to_date.tvpi:.2f}x")
+        with gpc2:
+            st.metric("Gross IRR (GP-reported)", f"{gp_reported_gross_irr*100:.1f}%" if gp_reported_gross_irr else "n/a")
+            st.metric("Net IRR (LP actual, to date)", f"{to_date.irr*100:.1f}%" if to_date.irr == to_date.irr else "n/a")
+        st.caption(
+            "Gross figures are whatever the GP reports (entered in the sidebar) -- they aren't "
+            "derivable from the LP's own cash flows alone, since historical fee/carry cash flows "
+            "aren't tracked separately here. Net is the LP's own actual to-date performance, "
+            "computed the same way as the Overview tab."
+        )
+    else:
+        st.caption(
+            "Enter the GP's reported Gross MOIC/IRR in the sidebar (section 5) to see it "
+            "alongside the LP's actual Net figures here."
+        )
+
+    st.subheader("Return & timing analytics")
+    ac1, ac2, ac3 = st.columns(3)
+    ac1.metric("MV CAGR (projected growth)", f"{mv_cagr*100:.1f}%")
+    ac2.metric("Cash-flow duration", f"{cf_duration_years:.2f} yrs")
+    ac3.metric("RV / MV multiple", f"{rv_mv_multiple:.2f}x" if rv_mv_multiple else "n/a (aggregate mode)")
+    st.caption(
+        "MV CAGR: the flat annual rate that compounds the current net NAV to the projected "
+        "total value (all future distributions + any residual NAV) over the cash-flow "
+        "duration below -- a single-number growth-rate summary of the whole forecast. "
+        "Cash-flow duration: the distribution-weighted average time until money comes back. "
+        "RV/MV multiple: aggregate Reported Value over aggregate (diligence-adjusted) Market "
+        "Value across portfolio companies -- only shown in Portfolio companies mode, since "
+        "Aggregate NAV mode doesn't distinguish the two."
+    )
+    mc1, mc2 = st.columns(2)
+    mc1.metric("MOIC, unadjusted for CFs", f"{moic_unadjusted:.2f}x")
+    mc2.metric("MOIC, adjusted for CFs", f"{moic_adjusted:.2f}x")
+    st.caption(
+        "Unadjusted: TVPI, a point-in-time (distributions + NAV) / paid-in snapshot, blind to "
+        "when cash actually arrives. Adjusted: the seller (0%-discount) pricing scenario's "
+        "MOIC, which nets the net NAV purchase price against the actual projected LP "
+        "distributions (+ unfunded returns, if enabled) -- timing-aware, and a closer match "
+        "to what an XIRR-based buyer/seller conversation is really pricing."
+    )
+
+    st.subheader("Pricing bridge")
+    bridge_scenario = st.selectbox("Scenario", ["At Par (0% discount)", f"Buyer ({buyer_target_discount*100:.0f}% discount)"])
+    bridge_row = seller_row_for_moic if bridge_scenario.startswith("At Par") else buyer_row
+    reported_value = net_nav
+    market_value = net_nav  # net_nav is already the buyer's diligence-adjusted view where applicable (portfolio mode)
+    gross_exposure = market_value + total_unfunded
+    net_funded_exposure = market_value
+    net_effective_price = bridge_row["price"]
+    bridge_df = pd.DataFrame([
+        {"Step": "Reported Value (net of accrued carry)", "$": reported_value},
+        {"Step": "Market Value", "$": market_value},
+        {"Step": "+ Unfunded Commitment -> Gross Exposure", "$": gross_exposure},
+        {"Step": "Net Funded Exposure (Market Value, funded only)", "$": net_funded_exposure},
+        {"Step": f"Net Effective Price ({bridge_scenario})", "$": net_effective_price},
+    ])
+    st.dataframe(bridge_df.style.format({"$": "${:,.0f}"}), width="stretch", hide_index=True)
+    st.caption(
+        "A step-by-step view of how the net NAV becomes a purchase price: the buyer's "
+        "diligence-adjusted Market Value, grossed up for the unfunded commitment still to be "
+        "called (Gross Exposure), separated back out to the funded-only exposure, and finally "
+        "discounted (or not, for At Par) to the negotiated Net Effective Price."
+    )
+
+with tab5:
     st.write("Ask the AI agent about this fund's metrics, forecast, or pricing.")
     question = st.text_area("Question", placeholder="e.g. What discount to NAV is needed for a 20% IRR?")
     if st.button("Ask") and question:
