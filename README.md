@@ -15,6 +15,18 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
    is needed for a 20% IRR?", "is this a good deal?"). It answers grounded in the exact numbers
    the engine computed. Works with an Anthropic API key (full LLM reasoning) or without one
    (deterministic rule-based summary), so the demo never breaks.
+5. **Fund vs. LP ownership** — a secondary prices ONE LP's slice of the fund, not the whole
+   fund. Enter the fund's total commitment and the selling LP's commitment; every fund-level $
+   figure you enter elsewhere (cash flows, NAV, accrued carry, unfunded amounts) is scaled down
+   to the LP's share automatically before anything downstream runs.
+6. **Unfunded commitment generates its own return** (optional) — a future capital call isn't
+   just an outflow; it funds a new investment that itself returns money. Turn this on to
+   project a return (hold period + MOIC) on every future call.
+7. **Bottom-up EV/EBITDA company model** (optional, Portfolio companies mode) — instead of a
+   flat "Expected Return %" per company, build each company's own Revenue -> EBITDA -> FCF ->
+   Exit EV/EBITDA model; the app backs out the equivalent annualized return from it.
+8. **Leverage overlay** (optional) — model the buyer financing part of the purchase price with
+   a subscription-line/NAV facility, shown alongside (never in place of) the unlevered return.
 
 ## Files
 

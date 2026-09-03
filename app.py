@@ -15,10 +15,13 @@ import streamlit as st
 from ai_agent import ask_agent
 from finance_engine import (
     apply_carry_waterfall,
+    build_unfunded_returns,
     build_unfunded_schedule,
+    ebitda_exit_value,
     forecast_cashflows,
     forecast_from_portfolio,
     fund_metrics_to_date,
+    implied_annual_return,
     leverage_overlay,
     reported_vs_market_value,
     secondary_pricing,
@@ -51,6 +54,21 @@ calls = df["Capital_Call"].fillna(0).tolist()
 dists = df["Distribution"].fillna(0).tolist()
 original_paid_in = sum(calls)
 original_distributions = sum(dists)
+
+st.sidebar.header("1B. Fund vs. LP ownership")
+st.sidebar.caption(
+    "A secondary prices ONE LP's slice of the fund, not the whole fund. Everything you "
+    "enter elsewhere in this app (the cash-flow CSV, NAV, accrued carry, unfunded amounts) "
+    "is fund-level; the app scales it down to the selling LP's share automatically."
+)
+fund_commitment = st.sidebar.number_input(
+    "Fund total commitment ($)", min_value=0.01, value=50_000_000.0, step=1_000_000.0, format="%.0f"
+)
+lp_commitment = st.sidebar.number_input(
+    "Selling LP's commitment ($)", min_value=0.0, value=2_500_000.0, step=100_000.0, format="%.0f"
+)
+lp_pct = (lp_commitment / fund_commitment) if fund_commitment > 0 else 0.0
+st.sidebar.caption(f"LP ownership = {lp_pct*100:.2f}% of the fund")
 
 st.sidebar.header("2. Current position")
 forecast_mode = st.sidebar.radio(
@@ -125,6 +143,50 @@ else:
         remaining_years = 1
     st.sidebar.caption(f"Aggregate Reported NAV from portfolio: ${nav_current:,.0f}")
 
+    valuation_method = st.sidebar.radio(
+        "Company valuation method",
+        ["Expected Return % (simple)", "Bottom-up EV/EBITDA model (detailed)"],
+        index=0,
+        help="Simple: use the flat 'Expected Return (%)' column above directly. Detailed: "
+             "build each company's own Revenue -> EBITDA -> FCF -> Exit EV/EBITDA model below; "
+             "the app backs out the equivalent annualized return and uses that instead (the "
+             "'Expected Return (%)' column above is then ignored for companies with a matching "
+             "row here). Exit timing (Exit Year 1) still comes from the table above.",
+    )
+    ebitda_df = None
+    if valuation_method.startswith("Bottom-up"):
+        st.sidebar.write("EV/EBITDA build per company (Company name must match the table above):")
+        default_ebitda = pd.DataFrame([
+            # Entry Revenue chosen so Entry Equity Value x Fund Ownership % lands close to
+            # each company's default Reported Value above -- otherwise the implied return
+            # comes out absurd purely from a scale mismatch between the two tables. Adjust
+            # freely; the two tables just need to describe the same company consistently.
+            {"Company": "Company A", "Entry Revenue ($M)": 10.7, "Entry EBITDA Margin (%)": 25.0,
+             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
+             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
+            {"Company": "Company B", "Entry Revenue ($M)": 7.7, "Entry EBITDA Margin (%)": 25.0,
+             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
+             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
+            {"Company": "Company C", "Entry Revenue ($M)": 7.5, "Entry EBITDA Margin (%)": 25.0,
+             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
+             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
+            {"Company": "Company D", "Entry Revenue ($M)": 10.7, "Entry EBITDA Margin (%)": 25.0,
+             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
+             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
+            {"Company": "Company E", "Entry Revenue ($M)": 6.8, "Entry EBITDA Margin (%)": 25.0,
+             "Entry EV/EBITDA (x)": 11.0, "Entry Net Debt/EBITDA (x)": 3.0, "Revenue Growth (%)": 8.0,
+             "FCF Conversion (%)": 50.0, "Exit EV/EBITDA (x)": 12.0, "Fund Ownership (%)": 70.0},
+        ])
+        ebitda_df = st.sidebar.data_editor(
+            default_ebitda, num_rows="dynamic", width="stretch", key="ebitda_editor"
+        )
+        st.sidebar.caption(
+            "Exit value = (Exit EBITDA x Exit EV/EBITDA multiple - Net Debt at exit) x Fund "
+            "Ownership %. Net Debt pays down by that year's FCF each year (floored at zero). "
+            "The app then solves for the flat annual rate that compounds the company's current "
+            "Market Value (from the table above) to this exit value by Exit Year 1."
+        )
+
 st.sidebar.header("4. Unfunded commitment")
 st.sidebar.write("Known follow-on investments (already identified):")
 default_followons = pd.DataFrame([
@@ -146,6 +208,25 @@ st.sidebar.caption(
     "Known follow-ons are called in full in their specified year. The blind pool is spread "
     "evenly over its call period, front-loaded like a typical PE investment period."
 )
+
+unfunded_generates_return = st.sidebar.checkbox(
+    "Unfunded commitment generates its own return", value=False,
+    help="A capital call doesn't just sit as an outflow -- it funds a new investment that "
+         "itself goes on to return money. Turn this on to project a return on every future "
+         "call, a fixed hold period and MOIC after which it lands.",
+)
+if unfunded_generates_return:
+    uc1, uc2 = st.sidebar.columns(2)
+    unfunded_hold_years = uc1.number_input("Hold period (years)", min_value=1, value=3, step=1)
+    unfunded_moic = uc2.number_input("Assumed MOIC (x)", min_value=0.1, value=1.5, step=0.1, format="%.1f")
+    st.sidebar.caption(
+        "Each call in year Y returns amount x MOIC in year Y + hold period. Calls that would "
+        "mature beyond the forecast horizon are excluded (flagged below) rather than distorting "
+        "the last forecast year."
+    )
+else:
+    unfunded_hold_years = 0
+    unfunded_moic = 0.0
 
 st.sidebar.header("5. Fees & carried interest")
 apply_fees = st.sidebar.checkbox("Apply management fee & carry", value=True)
@@ -180,32 +261,76 @@ st.sidebar.caption("No key? The assistant still answers using a rule-based summa
 # --------------------------------------------------------------------------
 # Core calculations
 # --------------------------------------------------------------------------
-to_date = fund_metrics_to_date(cf_dates, calls, dists, nav_current, as_of)
+# Fund -> LP scaling happens once, right here, for every fund-level $ figure
+# collected above. Everything downstream (to-date metrics, forecast, waterfall,
+# unfunded schedule, pricing, leverage) then runs unchanged on these LP-level
+# numbers -- ratios (DPI/RVPI/TVPI/IRR) are scale-invariant so they come out
+# identical to the fund-level view; only $ amounts shrink to the LP's slice.
+calls_lp = [c * lp_pct for c in calls]
+dists_lp = [d * lp_pct for d in dists]
+nav_current_lp = nav_current * lp_pct
+accrued_carry_lp = accrued_carry * lp_pct
 
+to_date = fund_metrics_to_date(cf_dates, calls_lp, dists_lp, nav_current_lp, as_of)
+
+ebitda_details = []  # per-company EV/EBITDA build detail, for tab2 display
 if forecast_mode == "Aggregate NAV (simple)":
     forecast_rows = forecast_cashflows(
-        nav_current, remaining_years, gross_return, shape, as_of,
+        nav_current_lp, remaining_years, gross_return, shape, as_of,
         mgmt_fee_rate=mgmt_fee if apply_fees else 0.0,
     )
     portfolio_display = None
 else:
+    ebitda_lookup = {}
+    if ebitda_df is not None and len(ebitda_df) > 0:
+        ebitda_lookup = {r["Company"]: r for _, r in ebitda_df.iterrows()}
+
     companies = []
     portfolio_display_rows = []
     for _, row in portfolio_df.iterrows():
         rv = float(row["Reported Value ($M)"]) * 1_000_000
         adj = float(row["MV Adjustment (%)"]) / 100
         mv = reported_vs_market_value(rv, adj)
+        mv_lp = mv * lp_pct
+        exit_year_1 = int(row["Exit Year 1"])
+
+        expected_return = float(row["Expected Return (%)"]) / 100
+        used_ebitda_model = False
+        e = ebitda_lookup.get(row["Company"])
+        if e is not None:
+            ev_result = ebitda_exit_value(
+                entry_revenue=float(e["Entry Revenue ($M)"]) * 1_000_000,
+                entry_ebitda_margin=float(e["Entry EBITDA Margin (%)"]) / 100,
+                entry_ev_multiple=float(e["Entry EV/EBITDA (x)"]),
+                entry_net_debt_ebitda=float(e["Entry Net Debt/EBITDA (x)"]),
+                revenue_growth=float(e["Revenue Growth (%)"]) / 100,
+                fcf_conversion=float(e["FCF Conversion (%)"]) / 100,
+                exit_year=exit_year_1,
+                exit_ev_multiple=float(e["Exit EV/EBITDA (x)"]),
+                fund_ownership_pct=float(e["Fund Ownership (%)"]) / 100,
+            )
+            exit_proceeds_lp = ev_result["exit_proceeds_to_fund"] * lp_pct
+            expected_return = implied_annual_return(mv_lp, exit_proceeds_lp, exit_year_1)
+            used_ebitda_model = True
+            ebitda_details.append({
+                "Company": row["Company"], **ev_result, "implied_return": expected_return,
+                "exit_proceeds_to_fund_lp": exit_proceeds_lp,
+            })
+
         companies.append({
             "name": row["Company"],
-            "current_value": mv,
-            "expected_return": float(row["Expected Return (%)"]) / 100,
-            "exit_year_1": int(row["Exit Year 1"]),
+            "current_value": mv_lp,
+            "expected_return": expected_return,
+            "exit_year_1": exit_year_1,
             "exit_pct_1": float(row["Exit % 1"]) / 100,
             "exit_year_2": int(row["Exit Year 2"]),
             "exit_pct_2": float(row["Exit % 2"]) / 100,
         })
         portfolio_display_rows.append({
-            "Company": row["Company"], "Reported Value": rv, "MV Adjustment": adj, "Market Value": mv,
+            "Company": row["Company"], "Reported Value (Fund)": rv, "MV Adjustment": adj,
+            "Market Value (Fund)": mv, "Market Value (LP)": mv_lp,
+            "Valuation method": "EV/EBITDA model" if used_ebitda_model else "Expected Return %",
+            "Return used": expected_return,
         })
     forecast_rows = forecast_from_portfolio(
         companies, mgmt_fee_rate=mgmt_fee if apply_fees else 0.0, as_of=as_of
@@ -214,39 +339,57 @@ else:
 
 if apply_fees:
     forecast_rows = apply_carry_waterfall(
-        cf_dates, calls, to_date.distributions, forecast_rows, hurdle_rate, carry_rate
+        cf_dates, calls_lp, to_date.distributions, forecast_rows, hurdle_rate, carry_rate
     )
     distribution_key = "lp_distribution"
 else:
     distribution_key = "gross_distribution"
 
 known_followons = [
-    {"name": r["Name"], "amount": float(r["Amount ($M)"]) * 1_000_000, "year": int(r["Year"])}
+    {"name": r["Name"], "amount": float(r["Amount ($M)"]) * 1_000_000 * lp_pct, "year": int(r["Year"])}
     for _, r in known_followons_df.iterrows()
 ] if len(known_followons_df) > 0 else []
-unfunded_calls = build_unfunded_schedule(known_followons, blind_pool_amount, blind_pool_years, forecast_rows)
+unfunded_calls = build_unfunded_schedule(known_followons, blind_pool_amount * lp_pct, blind_pool_years, forecast_rows)
 total_unfunded = sum(unfunded_calls.values())
 
-net_nav = max(0.0, nav_current - accrued_carry)
+if unfunded_generates_return:
+    unfunded_returns, unfunded_return_excluded = build_unfunded_returns(
+        unfunded_calls, unfunded_hold_years, unfunded_moic, forecast_rows
+    )
+else:
+    unfunded_returns, unfunded_return_excluded = {}, 0.0
+total_unfunded_return = sum(unfunded_returns.values())
+
+net_nav = max(0.0, nav_current_lp - accrued_carry_lp)
 
 discount_levels = [-0.10, 0.0, 0.10, 0.20, 0.30, 0.40]
-pricing = secondary_pricing(net_nav, forecast_rows, as_of, discount_levels, distribution_key, unfunded_calls)
+pricing = secondary_pricing(net_nav, forecast_rows, as_of, discount_levels, distribution_key,
+                             unfunded_calls, unfunded_returns)
 
 buyer_target_discount = 0.15  # used for the Buyer-vs-Seller headline comparison in tab 3
-buyer_row = secondary_pricing(net_nav, forecast_rows, as_of, [buyer_target_discount], distribution_key, unfunded_calls)[0]
+buyer_row = secondary_pricing(net_nav, forecast_rows, as_of, [buyer_target_discount], distribution_key,
+                               unfunded_calls, unfunded_returns)[0]
 
 leverage_result = None
 if use_leverage and leverage_pct > 0:
     leverage_result = leverage_overlay(
-        buyer_row, forecast_rows, as_of, distribution_key, unfunded_calls, leverage_pct, leverage_rate
+        buyer_row, forecast_rows, as_of, distribution_key, unfunded_calls, leverage_pct, leverage_rate,
+        unfunded_returns,
     )
 
 metrics_context = {
+    "fund_lp": {
+        "fund_commitment": fund_commitment,
+        "lp_commitment": lp_commitment,
+        "lp_pct": lp_pct,
+        "fund_nav": nav_current,
+        "lp_nav": nav_current_lp,
+    },
     "to_date": {
         "paid_in": to_date.paid_in,
         "distributions": to_date.distributions,
         "nav_reported": to_date.nav,
-        "accrued_carry_to_date": accrued_carry,
+        "accrued_carry_to_date": accrued_carry_lp,
         "net_nav_after_accrued_carry": net_nav,
         "dpi": to_date.dpi,
         "rvpi": to_date.rvpi,
@@ -265,11 +408,16 @@ metrics_context = {
         "mgmt_fee": mgmt_fee,
         "hurdle_rate": hurdle_rate,
         "carry_rate": carry_rate,
-        "accrued_carry_to_date": accrued_carry,
+        "accrued_carry_to_date": accrued_carry_lp,
         "known_followons": known_followons,
-        "blind_pool_amount": blind_pool_amount,
+        "blind_pool_amount": blind_pool_amount * lp_pct,
         "blind_pool_years": blind_pool_years,
         "total_unfunded": total_unfunded,
+        "unfunded_generates_return": unfunded_generates_return,
+        "unfunded_hold_years": unfunded_hold_years,
+        "unfunded_moic": unfunded_moic,
+        "total_unfunded_return": total_unfunded_return,
+        "unfunded_return_excluded_beyond_horizon": unfunded_return_excluded,
     },
     "leverage": {
         "used": use_leverage and leverage_pct > 0,
@@ -293,39 +441,60 @@ tab1, tab2, tab3, tab4 = st.tabs(
 )
 
 with tab1:
+    st.caption(
+        f"Fund commitment ${fund_commitment:,.0f} | Selling LP's commitment ${lp_commitment:,.0f} "
+        f"({lp_pct*100:.2f}% of the fund) | Fund NAV ${nav_current:,.0f} -> LP NAV ${nav_current_lp:,.0f}. "
+        f"Everything below is the LP's slice."
+    )
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Paid-in Capital", f"${to_date.paid_in:,.0f}")
-    c2.metric("Distributions to date", f"${to_date.distributions:,.0f}")
-    c3.metric("Reported NAV", f"${to_date.nav:,.0f}")
+    c1.metric("Paid-in Capital (LP)", f"${to_date.paid_in:,.0f}")
+    c2.metric("Distributions to date (LP)", f"${to_date.distributions:,.0f}")
+    c3.metric("Reported NAV (LP)", f"${to_date.nav:,.0f}")
     c4.metric("TVPI", f"{to_date.tvpi:.2f}x")
 
     c5, c6, c7 = st.columns(3)
     irr_txt = f"{to_date.irr*100:.1f}%" if to_date.irr == to_date.irr else "n/a"
     c5.metric("IRR to date", irr_txt)
     c6.metric("DPI / RVPI", f"{to_date.dpi:.2f}x / {to_date.rvpi:.2f}x")
-    c7.metric("Net NAV (after accrued carry)", f"${net_nav:,.0f}")
-    if accrued_carry > 0:
+    c7.metric("Net NAV (LP, after accrued carry)", f"${net_nav:,.0f}")
+    if accrued_carry_lp > 0:
         st.caption(
-            f"${accrued_carry:,.0f} of carry has already crystallized/is owed to the GP as of "
-            f"the as-of date, so only ${net_nav:,.0f} of the ${to_date.nav:,.0f} reported NAV "
-            f"is economically available to the LP."
+            f"${accrued_carry_lp:,.0f} of carry (LP share) has already crystallized/is owed to "
+            f"the GP as of the as-of date, so only ${net_nav:,.0f} of the ${to_date.nav:,.0f} "
+            f"reported NAV is economically available to the LP."
         )
 
     fig = go.Figure()
-    fig.add_bar(x=[d.isoformat() for d in cf_dates], y=[-c for c in calls], name="Capital Calls")
-    fig.add_bar(x=[d.isoformat() for d in cf_dates], y=dists, name="Distributions")
-    fig.update_layout(title="Historical Cash Flows", barmode="relative")
+    fig.add_bar(x=[d.isoformat() for d in cf_dates], y=[-c for c in calls_lp], name="Capital Calls (LP)")
+    fig.add_bar(x=[d.isoformat() for d in cf_dates], y=dists_lp, name="Distributions (LP)")
+    fig.update_layout(title="Historical Cash Flows (LP share)", barmode="relative")
     st.plotly_chart(fig, width="stretch")
 
 with tab2:
     if portfolio_display is not None:
-        st.write("Reported Value vs. buyer-adjusted Market Value per company:")
+        st.write("Reported Value vs. buyer-adjusted Market Value per company (Fund-level and the selling LP's share):")
         st.dataframe(
             portfolio_display.style.format({
-                "Reported Value": "${:,.0f}", "Market Value": "${:,.0f}", "MV Adjustment": "{:+.0%}",
+                "Reported Value (Fund)": "${:,.0f}", "Market Value (Fund)": "${:,.0f}",
+                "Market Value (LP)": "${:,.0f}", "MV Adjustment": "{:+.0%}", "Return used": "{:+.1%}",
             }),
             width="stretch",
         )
+        if ebitda_details:
+            with st.expander("Bottom-up EV/EBITDA build detail"):
+                for d in ebitda_details:
+                    st.markdown(f"**{d['Company']}**")
+                    ec1, ec2, ec3, ec4 = st.columns(4)
+                    ec1.metric("Entry Equity Value", f"${d['entry_equity_value']:,.0f}")
+                    ec2.metric("Exit EBITDA", f"${d['exit_ebitda']:,.0f}")
+                    ec3.metric("Exit Equity Value", f"${d['exit_equity_value']:,.0f}")
+                    ec4.metric("Implied annual return", f"{d['implied_return']*100:.1f}%")
+                    st.caption(
+                        f"Exit proceeds to fund ${d['exit_proceeds_to_fund']:,.0f} at year "
+                        f"{d['exit_year']} -> LP share ${d['exit_proceeds_to_fund_lp']:,.0f}. This "
+                        f"implied return is what compounds the company's LP-level current Market "
+                        f"Value to that LP-level exit proceeds by the exit year."
+                    )
 
     fdf = pd.DataFrame(forecast_rows)
 
@@ -348,7 +517,18 @@ with tab2:
             st.dataframe(exit_df.style.format({"Exit Value": "${:,.0f}"}), width="stretch")
 
     if total_unfunded > 0:
-        st.caption(f"Buyer's unfunded call schedule (${total_unfunded:,.0f} total): {unfunded_calls}")
+        st.caption(f"Buyer's unfunded call schedule (${total_unfunded:,.0f} total, LP share): {unfunded_calls}")
+    if unfunded_generates_return and total_unfunded_return > 0:
+        st.caption(
+            f"Projected return on that unfunded commitment (${total_unfunded_return:,.0f} total, "
+            f"LP share, at {unfunded_moic:.1f}x MOIC over a {unfunded_hold_years}-year hold): "
+            f"{unfunded_returns}"
+        )
+        if unfunded_return_excluded > 0:
+            st.caption(
+                f"${unfunded_return_excluded:,.0f} of unfunded return falls beyond the forecast "
+                f"horizon and is excluded rather than distorting the last year."
+            )
 
     if apply_fees:
         st.caption(
@@ -398,7 +578,8 @@ with tab2:
 
 with tab3:
     st.subheader("Buyer vs. Seller")
-    seller_row = secondary_pricing(net_nav, forecast_rows, as_of, [0.0], distribution_key, unfunded_calls)[0]
+    seller_row = secondary_pricing(net_nav, forecast_rows, as_of, [0.0], distribution_key,
+                                    unfunded_calls, unfunded_returns)[0]
     bc1, bc2 = st.columns(2)
     with bc1:
         st.markdown("**Seller (holds at par to net NAV, 0% discount)**")
@@ -449,19 +630,30 @@ with tab3:
     if total_unfunded > 0:
         st.caption(
             f"Buyer also funds ${total_unfunded:,.0f} of unfunded commitment (known follow-ons + "
-            f"blind pool) - included in 'Total invested' and netted against distributions below."
+            f"blind pool, LP share) - included in 'Total invested' and netted against distributions below."
         )
-    if accrued_carry > 0:
-        st.caption(f"Priced off net NAV of ${net_nav:,.0f} (reported NAV less ${accrued_carry:,.0f} accrued carry).")
+    if unfunded_generates_return and total_unfunded_return > 0:
+        st.caption(
+            f"That unfunded commitment also returns ${total_unfunded_return:,.0f} (LP share) - "
+            f"included in 'Total value' and 'moic', but NOT in 'Total invested' (the call amount "
+            f"already covers that side)."
+        )
+    if accrued_carry_lp > 0:
+        st.caption(f"Priced off net NAV of ${net_nav:,.0f} (reported NAV less ${accrued_carry_lp:,.0f} accrued carry, LP share).")
     pdf_ = pd.DataFrame(pricing)
     pdf_display = pdf_.copy()
     pdf_display["discount"] = pdf_display["discount"].map(lambda x: f"{x*100:.0f}%")
     pdf_display["price"] = pdf_display["price"].map(lambda x: f"${x:,.0f}")
     pdf_display["unfunded_calls"] = pdf_display["unfunded_calls"].map(lambda x: f"${x:,.0f}")
+    pdf_display["unfunded_returns"] = pdf_display["unfunded_returns"].map(lambda x: f"${x:,.0f}")
     pdf_display["total_invested"] = pdf_display["total_invested"].map(lambda x: f"${x:,.0f}")
     pdf_display["irr"] = pdf_display["irr"].map(lambda x: f"{x*100:.1f}%" if x == x else "n/a")
     pdf_display["moic"] = pdf_display["moic"].map(lambda x: f"{x:.2f}x")
-    display_cols = ["discount", "price", "unfunded_calls", "total_invested", "irr", "moic"] if total_unfunded > 0 else ["discount", "price", "irr", "moic"]
+    display_cols = ["discount", "price", "unfunded_calls", "total_invested", "irr", "moic"]
+    if unfunded_generates_return and total_unfunded_return > 0:
+        display_cols.insert(3, "unfunded_returns")
+    if not total_unfunded > 0:
+        display_cols = [c for c in display_cols if c not in ("unfunded_calls", "total_invested")]
     st.dataframe(pdf_display[display_cols], width="stretch")
 
     fig3 = go.Figure()

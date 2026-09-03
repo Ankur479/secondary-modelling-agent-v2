@@ -227,6 +227,87 @@ def forecast_from_portfolio(companies: List[Dict], mgmt_fee_rate: float, as_of: 
     return rows
 
 
+def ebitda_exit_value(entry_revenue: float, entry_ebitda_margin: float, entry_ev_multiple: float,
+                       entry_net_debt_ebitda: float, revenue_growth: float, fcf_conversion: float,
+                       exit_year: int, exit_ev_multiple: float, fund_ownership_pct: float) -> Dict:
+    """
+    Bottom-up operating build for one portfolio company (mirrors a standalone
+    EV/EBITDA asset model): Entry Revenue/EBITDA margin/EV multiple/Net Debt
+    give the entry capital structure; the company then grows Revenue at a flat
+    annual rate, holding its EBITDA margin flat, generating free cash flow
+    (fcf_conversion x EBITDA) that pays down Net Debt dollar-for-dollar each
+    year (floored at zero -- debt doesn't go negative into a net cash position
+    here for simplicity). At exit_year, the year's EBITDA is re-rated at
+    exit_ev_multiple to get Exit Enterprise Value, less that year's remaining
+    Net Debt, to get Exit Equity Value; fund_ownership_pct converts that into
+    the fund's Gross Proceeds.
+
+    Returns a dict with the full year-by-year schedule plus the exit summary,
+    so a caller can both show the build and use exit_proceeds_to_fund
+    downstream (e.g. to back out an implied annualized return for
+    forecast_from_portfolio -- see app.py).
+    """
+    entry_ebitda = entry_revenue * entry_ebitda_margin
+    entry_ev = entry_ebitda * entry_ev_multiple
+    entry_net_debt = entry_ebitda * entry_net_debt_ebitda
+    entry_equity = entry_ev - entry_net_debt
+
+    exit_year = max(1, int(exit_year))
+    schedule = []
+    revenue = entry_revenue
+    net_debt = entry_net_debt
+    exit_ebitda = entry_ebitda
+    exit_net_debt = entry_net_debt
+    for t in range(1, exit_year + 1):
+        revenue = revenue * (1 + revenue_growth)
+        ebitda = revenue * entry_ebitda_margin
+        fcf = ebitda * fcf_conversion
+        beginning_net_debt = net_debt
+        net_debt = max(0.0, net_debt - fcf)
+        schedule.append({
+            "year": t, "revenue": revenue, "ebitda": ebitda, "fcf": fcf,
+            "beginning_net_debt": beginning_net_debt, "ending_net_debt": net_debt,
+        })
+        if t == exit_year:
+            exit_ebitda = ebitda
+            exit_net_debt = net_debt
+
+    exit_enterprise_value = exit_ebitda * exit_ev_multiple
+    exit_equity_value = exit_enterprise_value - exit_net_debt
+    exit_proceeds_to_fund = exit_equity_value * fund_ownership_pct
+
+    return {
+        "entry_ebitda": entry_ebitda,
+        "entry_ev": entry_ev,
+        "entry_net_debt": entry_net_debt,
+        "entry_equity_value": entry_equity,
+        "schedule": schedule,
+        "exit_year": exit_year,
+        "exit_ebitda": exit_ebitda,
+        "exit_enterprise_value": exit_enterprise_value,
+        "exit_net_debt": exit_net_debt,
+        "exit_equity_value": exit_equity_value,
+        "exit_proceeds_to_fund": exit_proceeds_to_fund,
+    }
+
+
+def implied_annual_return(current_value: float, exit_value: float, years: int) -> float:
+    """
+    Backs out the flat annualized growth rate that would take `current_value`
+    to `exit_value` over `years` -- lets an EV/EBITDA-derived exit_proceeds_to_fund
+    (see ebitda_exit_value above) plug straight into forecast_from_portfolio's
+    'expected_return' compounding without changing that function at all: after
+    `years` of compounding at this rate, current_value lands exactly on
+    exit_value (before management fees, which forecast_from_portfolio still
+    applies on top, same as the simple Expected-Return% mode).
+    """
+    if current_value <= 0 or years <= 0:
+        return 0.0
+    if exit_value <= 0:
+        return -1.0  # total loss, compounds to zero
+    return (exit_value / current_value) ** (1.0 / years) - 1.0
+
+
 def reported_vs_market_value(reported_value: float, mv_adjustment: float) -> float:
     """
     Market Value = a buyer's own diligence-adjusted view of a holding's value,
@@ -340,13 +421,46 @@ def build_unfunded_schedule(known_followons: List[Dict], blind_pool_amount: floa
     return schedule
 
 
+def build_unfunded_returns(unfunded_calls: Dict[int, float], hold_years: int, moic: float,
+                            forecast_rows: List[Dict]) -> Tuple[Dict[int, float], float]:
+    """
+    A buyer's future capital-call obligation isn't purely an outflow -- the capital
+    called funds a new investment that itself goes on to return money. Each call in
+    year Y is assumed to return `moic` times its amount, `hold_years` after it was
+    called (a simplifying single-hold-period assumption, since we don't have a real
+    forecast for money not yet even called).
+
+    Returns (returns_by_year, excluded_amount): `returns_by_year` is a {year:
+    return_amount} dict shaped like unfunded_calls, only for calls whose maturity
+    (year + hold_years) still falls within the forecast horizon; `excluded_amount`
+    is the total return from calls that mature beyond the horizon (dropped rather
+    than distorting the forecast's last year), so callers can flag it in the UI.
+    """
+    n = len(forecast_rows)
+    returns_by_year = {r["year"]: 0.0 for r in forecast_rows}
+    excluded_amount = 0.0
+    if n == 0 or hold_years <= 0 or moic <= 0:
+        return returns_by_year, excluded_amount
+    for call_year, amount in (unfunded_calls or {}).items():
+        if not amount:
+            continue
+        maturity_year = int(call_year) + int(hold_years)
+        return_amount = float(amount) * float(moic)
+        if maturity_year <= n:
+            returns_by_year[maturity_year] = returns_by_year.get(maturity_year, 0.0) + return_amount
+        else:
+            excluded_amount += return_amount
+    return returns_by_year, excluded_amount
+
+
 # ---------------------------------------------------------------------------
 # Secondary pricing
 # ---------------------------------------------------------------------------
 
 def leverage_overlay(scenario: Dict, forecast_rows: List[Dict], as_of: date,
                       distribution_key: str, unfunded_calls: Dict[int, float],
-                      leverage_pct: float, interest_rate: float) -> Dict:
+                      leverage_pct: float, interest_rate: float,
+                      unfunded_returns: Dict[int, float] = None) -> Dict:
     """
     Overlays debt financing on top of one secondary_pricing() scenario (e.g. the
     buyer's row at a given discount): the buyer draws `leverage_pct` of the
@@ -355,13 +469,19 @@ def leverage_overlay(scenario: Dict, forecast_rows: List[Dict], as_of: date,
 
     Repayment logic (documented, overridable assumption -- desks vary on how
     aggressively they sweep): each period, whatever cash the fund actually
-    distributes net of that period's unfunded call (if positive) is swept to
-    pay accrued interest first, then principal, until the balance hits zero.
-    If a period's net cash flow is zero or negative (e.g. a call exceeds that
-    period's distribution), no debt service happens that period and the
-    accrued interest capitalizes into the balance rather than erroring.
-    The facility only finances the purchase price -- unfunded capital calls
-    are always funded directly by the equity holder, never by this facility.
+    distributes (plus any unfunded-commitment return maturing that period) net
+    of that period's unfunded call (if positive) is swept to pay accrued
+    interest first, then principal, until the balance hits zero. If a period's
+    net cash flow is zero or negative (e.g. a call exceeds that period's
+    distribution), no debt service happens that period and the accrued
+    interest capitalizes into the balance rather than erroring. The facility
+    only finances the purchase price -- unfunded capital calls are always
+    funded directly by the equity holder, never by this facility.
+
+    unfunded_returns: optional {year: return_amount} from build_unfunded_returns()
+    -- cash the unfunded commitment itself returns once it matures. Treated the
+    same as a distribution (available for debt service, then paid to equity),
+    since by the time it lands it's just cash in the buyer's hands.
 
     Returns levered IRR/MOIC for the buyer's equity cash flows only, meant to
     be shown ALONGSIDE (never instead of) the unlevered scenario['irr'] /
@@ -371,6 +491,7 @@ def leverage_overlay(scenario: Dict, forecast_rows: List[Dict], as_of: date,
     At leverage_pct = 0.0 this reproduces scenario['irr'] and scenario['moic']
     exactly (same cash flows, same formulas) -- see test_leverage_overlay.py.
     """
+    unfunded_returns = unfunded_returns or {}
     price = scenario["price"]
     total_calls = scenario["unfunded_calls"]
     initial_draw = price * leverage_pct
@@ -384,7 +505,7 @@ def leverage_overlay(scenario: Dict, forecast_rows: List[Dict], as_of: date,
     equity_returned_total = 0.0
 
     for r in forecast_rows:
-        gross_dist = r[distribution_key]
+        gross_dist = r[distribution_key] + unfunded_returns.get(r["year"], 0.0)
         call = unfunded_calls.get(r["year"], 0.0)
         net_cf = gross_dist - call
         period_years = max((r["date"] - prev_date).days, 0) / 365.0
@@ -435,28 +556,38 @@ def leverage_overlay(scenario: Dict, forecast_rows: List[Dict], as_of: date,
 
 def secondary_pricing(nav_current: float, forecast_rows: List[Dict], as_of: date,
                        discount_levels: List[float], distribution_key: str = "gross_distribution",
-                       unfunded_calls: Dict[int, float] = None) -> List[Dict]:
+                       unfunded_calls: Dict[int, float] = None,
+                       unfunded_returns: Dict[int, float] = None) -> List[Dict]:
     """discount_levels: positive = discount to NAV, negative = premium.
     distribution_key: which forecast field the buyer actually receives
     ('gross_distribution' if ignoring fees/carry, 'lp_distribution' if applying them).
     unfunded_calls: optional {year: call_amount} the buyer must additionally fund;
-    these are netted against distributions and added to the buyer's invested capital."""
+    these are netted against distributions and added to the buyer's invested capital.
+    unfunded_returns: optional {year: return_amount} from build_unfunded_returns() --
+    cash the unfunded commitment itself returns once it matures; added to distributions
+    and to total value received (but NOT to invested capital -- the call amount already
+    covers that side)."""
     unfunded_calls = unfunded_calls or {}
+    unfunded_returns = unfunded_returns or {}
     total_calls = sum(unfunded_calls.values())
+    total_returns = sum(unfunded_returns.values())
     results = []
     for disc in discount_levels:
         price = nav_current * (1 - disc)
         cashflows = [(as_of, -price)] + [
-            (r["date"], r[distribution_key] - unfunded_calls.get(r["year"], 0.0)) for r in forecast_rows
+            (r["date"], r[distribution_key] - unfunded_calls.get(r["year"], 0.0)
+             + unfunded_returns.get(r["year"], 0.0))
+            for r in forecast_rows
         ]
         irr = xirr(cashflows)
-        total_dist = sum(r[distribution_key] for r in forecast_rows)
+        total_dist = sum(r[distribution_key] for r in forecast_rows) + total_returns
         total_invested = price + total_calls
         moic = total_dist / total_invested if total_invested else float("nan")
         results.append({
             "discount": disc,
             "price": price,
             "unfunded_calls": total_calls,
+            "unfunded_returns": total_returns,
             "total_invested": total_invested,
             "irr": irr,
             "moic": moic,
