@@ -121,51 +121,413 @@ if forecast_mode == "Aggregate NAV (simple)":
     remaining_years = st.sidebar.slider("Remaining fund life (years)", 1, 10, 5)
     gross_return = st.sidebar.slider("Expected gross annual return on remaining NAV", 0.0, 0.30, 0.15, step=0.01)
     shape = st.sidebar.selectbox("Distribution runoff shape", ["back_ended", "even", "front_ended"], index=0)
-    portfolio_df = None
 else:
     gross_return = None
     shape = None
-    st.sidebar.write(
-        "Portfolio companies - Reported Value is the GP's official mark; MV Adjustment "
-        "lets you apply your own diligence-based view on top of it."
-    )
-    # Defaults are the five current investments of the source deal, at fund level.
-    # Cost / Reported Value / Market Value and the investment dates come straight from
-    # the Fund Model's "Current Investments" block; Exit Year 1 is that company's exit
-    # calendar year expressed as a forecast year off the as-of date (2028 -> 3, etc.).
-    default_portfolio = pd.DataFrame([
-        {"Company": "Asset A", "Investment Date": date(2022, 3, 1), "Cost Basis ($M)": 77.0,
-         "Reported Value ($M)": 188.0, "MV Adjustment (%)": 0.0,
-         "Expected Return (%)": 25.0, "Exit Year 1": 3, "Exit % 1": 100.0, "Exit Year 2": 3, "Exit % 2": 0.0},
-        {"Company": "Asset B", "Investment Date": date(2023, 1, 1), "Cost Basis ($M)": 115.0,
-         "Reported Value ($M)": 132.0, "MV Adjustment (%)": 0.0,
-         "Expected Return (%)": 12.0, "Exit Year 1": 5, "Exit % 1": 100.0, "Exit Year 2": 5, "Exit % 2": 0.0},
-        {"Company": "Asset C", "Investment Date": date(2022, 10, 1), "Cost Basis ($M)": 62.0,
-         "Reported Value ($M)": 122.0, "MV Adjustment (%)": 6.5574,
-         "Expected Return (%)": 20.0, "Exit Year 1": 1, "Exit % 1": 100.0, "Exit Year 2": 1, "Exit % 2": 0.0},
-        {"Company": "Asset D", "Investment Date": date(2024, 2, 1), "Cost Basis ($M)": 84.9,
-         "Reported Value ($M)": 110.2, "MV Adjustment (%)": 0.0,
-         "Expected Return (%)": 25.0, "Exit Year 1": 4, "Exit % 1": 100.0, "Exit Year 2": 4, "Exit % 2": 0.0},
-        {"Company": "Asset E", "Investment Date": date(2024, 6, 1), "Cost Basis ($M)": 87.5,
-         "Reported Value ($M)": 105.1, "MV Adjustment (%)": 0.0,
-         "Expected Return (%)": 12.0, "Exit Year 1": 6, "Exit % 1": 100.0, "Exit Year 2": 6, "Exit % 2": 0.0},
-    ])
-    portfolio_df = st.sidebar.data_editor(
-        default_portfolio, num_rows="dynamic", width="stretch", key="portfolio_editor"
-    )
-    if len(portfolio_df) > 0:
-        nav_current = float(portfolio_df["Reported Value ($M)"].sum()) * 1_000_000
-        remaining_years = int(max(portfolio_df["Exit Year 1"].max(), portfolio_df["Exit Year 2"].max()))
-    else:
-        nav_current = 0.0
-        remaining_years = 1
-    st.sidebar.caption(f"Aggregate Reported NAV from portfolio: ${nav_current:,.0f}")
     st.sidebar.caption(
-        "Add a row here and a full bottom-up model for that company appears in the "
-        "**Asset Model (Bottom-up)** tab, where its operating build and exit valuation are "
-        "set. Whatever each asset model projects drives that company's return here."
+        "Every per-company input -- cost, marks, exit timing and the full operating build -- "
+        "lives in the **Asset Model (Bottom-up)** tab, one section per company. Add or remove "
+        "companies there too."
     )
 
+
+# --------------------------------------------------------------------------
+# Tabs
+# --------------------------------------------------------------------------
+# Created up front because the Asset Model tab is rendered FIRST, before the core
+# calculations below: each asset's bottom-up build is what sets that company's
+# expected return, so its inputs have to be read before the fund-level forecast
+# runs. Streamlit lets a tab be written into at any point in the script, so the
+# remaining tabs are filled in further down, after the numbers exist.
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "Asset Model (Bottom-up)", "AI Assistant"]
+)
+
+# --------------------------------------------------------------------------
+# Asset Model (Bottom-up) -- one full company model per portfolio holding
+# --------------------------------------------------------------------------
+# Per-asset defaults: the five current investments of the source deal, at fund level.
+# Keyed by a STABLE id, not by name -- the name is itself an editable field, and keying
+# widgets off a value the user can change would reset that company's whole model the
+# moment it's renamed.
+ASSET_DEFAULTS = {
+    "A": {"name": "Asset A", "inv_date": date(2022, 3, 1), "cost": 77.0, "rv": 188.0,
+          "mv_adj": 0.0, "exit_cal": 2028, "entry_revenue": 98.1, "prior_proceeds": 238.1,
+          "expected_return": 25.0},
+    "B": {"name": "Asset B", "inv_date": date(2023, 1, 1), "cost": 115.0, "rv": 132.0,
+          "mv_adj": 0.0, "exit_cal": 2030, "entry_revenue": 68.8, "prior_proceeds": 214.2,
+          "expected_return": 12.0},
+    "C": {"name": "Asset C", "inv_date": date(2022, 10, 1), "cost": 62.0, "rv": 122.0,
+          "mv_adj": 6.5574, "exit_cal": 2026, "entry_revenue": 83.8, "prior_proceeds": 153.9,
+          "expected_return": 20.0},
+    "D": {"name": "Asset D", "inv_date": date(2024, 2, 1), "cost": 84.9, "rv": 110.2,
+          "mv_adj": 0.0, "exit_cal": 2029, "entry_revenue": 102.4, "prior_proceeds": 282.5,
+          "expected_return": 25.0},
+    "E": {"name": "Asset E", "inv_date": date(2024, 6, 1), "cost": 87.5, "rv": 105.1,
+          "mv_adj": 0.0, "exit_cal": 2031, "entry_revenue": 53.5, "prior_proceeds": 187.4,
+          "expected_return": 12.0},
+}
+COMMON_DEFAULTS = {
+    "entry_ebitda_margin": 25.0, "entry_ev_multiple": 11.0, "entry_net_debt_ebitda": 3.0,
+    "fund_ownership": 70.0, "exit_ev_multiple": 12.0, "revenue_growth": 8.0,
+    "ebitda_margin": 25.0, "fcf_conversion": 50.0,
+}
+
+asset_builds = {}      # company name -> {"build": ..., "returns": ..., "drives_forecast": bool}
+portfolio_rows = []    # the portfolio table, now assembled from each company's Deal Snapshot
+
+if forecast_mode == "Portfolio companies (detailed)":
+    st.session_state.setdefault("asset_ids", list(ASSET_DEFAULTS.keys()))
+    st.session_state.setdefault("asset_seq", 0)
+
+
+def _asset_default(aid, field):
+    """Default for one field of one asset: the deal's own value if it's one of the five
+    originals, otherwise a generic starting point for a company the user just added."""
+    if aid in ASSET_DEFAULTS:
+        return ASSET_DEFAULTS[aid][field]
+    generic = {
+        "name": f"New Asset {aid}", "inv_date": as_of, "cost": 0.0, "rv": 10.0,
+        "mv_adj": 0.0, "exit_cal": as_of.year + 3, "prior_proceeds": 0.0,
+        "expected_return": 15.0,
+    }
+    if field == "entry_revenue":
+        # Size entry revenue so entry equity x ownership lands near this company's
+        # Reported Value -- otherwise a new company opens on an absurd implied return.
+        rv = st.session_state.get(f"am_{aid}_rv", generic["rv"])
+        return round(float(rv) / 1.4, 1) if rv else 10.0
+    return generic[field]
+
+
+def _asset_state(aid, field):
+    """Current value of a Deal Snapshot field, read before the widgets are drawn.
+    Streamlit populates session_state ahead of the script run, so this is the live
+    value -- which lets fund-level totals (NAV, horizon) be computed up front."""
+    return st.session_state.get(f"am_{aid}_{field}", _asset_default(aid, field))
+
+
+with tab4:
+    st.subheader("Asset Model (Bottom-up)")
+    if forecast_mode != "Portfolio companies (detailed)":
+        st.info(
+            "Switch **Forecast mode** to *Portfolio companies (detailed)* in the sidebar to "
+            "model each holding bottom-up. In Aggregate NAV mode the fund is projected off a "
+            "single NAV and runoff curve instead, so there are no individual assets to build."
+        )
+    else:
+        st.caption(
+            "One model per holding, in $mm at fund level, laid out like the source workbook's "
+            "per-asset tabs. Everything is editable here -- Deal Snapshot included -- and this "
+            "is the only place these numbers are entered, so the fund-level NAV, forecast "
+            "horizon and pricing all follow from what you set below."
+        )
+
+        asset_ids = st.session_state["asset_ids"]
+        # Fund-level totals have to be known before any company renders (% of Fund RV needs
+        # the total; the projection grid needs the longest hold). Both are read straight from
+        # session_state, so they reflect this run's edits rather than lagging a rerun behind.
+        total_rv = sum(float(_asset_state(aid, "rv")) for aid in asset_ids) if asset_ids else 0.0
+        nav_current = total_rv * 1_000_000
+        exit_rels = [max(1, int(_asset_state(aid, "exit_cal")) - as_of.year) for aid in asset_ids]
+        remaining_years = max(exit_rels) if exit_rels else 1
+        proj_years = [as_of.year + t for t in range(1, max(1, remaining_years) + 1)]
+
+        hc1, hc2, hc3 = st.columns(3)
+        hc1.metric("Companies", f"{len(asset_ids)}")
+        hc2.metric("Aggregate Reported Value", f"${nav_current:,.0f}")
+        hc3.metric("Forecast horizon", f"{remaining_years} yrs ({proj_years[0]}-{proj_years[-1]})")
+
+        if st.button("➕ Add a company", key="am_add"):
+            st.session_state["asset_seq"] += 1
+            st.session_state["asset_ids"].append(f"N{st.session_state['asset_seq']}")
+            st.rerun()
+
+        if not asset_ids:
+            st.info("No companies yet -- click **Add a company** above to start one.")
+
+        for aid in list(asset_ids):
+            name = str(_asset_state(aid, "name"))
+
+            with st.expander(f"{name}", expanded=False):
+                sc1, sc2 = st.columns([4, 1])
+                with sc2:
+                    if st.button("Remove", key=f"am_{aid}_remove"):
+                        st.session_state["asset_ids"].remove(aid)
+                        st.rerun()
+                drives = st.checkbox(
+                    "Use this asset model to drive the fund forecast", value=True,
+                    key=f"am_{aid}_drives",
+                    help="On: this company's expected return in the forecast is whatever this "
+                         "model implies (its exit proceeds compounded back from today's Market "
+                         "Value). Off: the fallback 'Expected Return (%)' below is used instead, "
+                         "and this model is display-only.",
+                )
+
+                st.markdown("**Deal Snapshot**")
+                d1, d2, d3 = st.columns(3)
+                name = d1.text_input(
+                    "Company", value=_asset_default(aid, "name"), key=f"am_{aid}_name",
+                )
+                inv_date = d2.date_input(
+                    "Investment Date", value=_asset_default(aid, "inv_date"),
+                    min_value=date(1990, 1, 1), max_value=date(2100, 12, 31), key=f"am_{aid}_inv_date",
+                )
+                cost_m = d3.number_input(
+                    "LP Cost ($mm, gross)", min_value=0.0, value=float(_asset_default(aid, "cost")),
+                    step=0.1, format="%.1f", key=f"am_{aid}_cost",
+                )
+                d4, d5, d6 = st.columns(3)
+                rv_m = d4.number_input(
+                    "Reported Value (RV, $mm)", min_value=0.0, value=float(_asset_default(aid, "rv")),
+                    step=0.1, format="%.1f", key=f"am_{aid}_rv",
+                    help="The GP's official mark for this company, at fund level.",
+                )
+                adj_pct = d5.number_input(
+                    "MV Adjustment (%)", value=float(_asset_default(aid, "mv_adj")), step=0.5,
+                    format="%.4f", key=f"am_{aid}_mv_adj",
+                    help="Your own diligence view on top of the GP's mark. Market Value = RV x "
+                         "(1 + this). Leave at 0 to take the mark at face value.",
+                )
+                exit_cal = int(d6.number_input(
+                    "Exit Year", min_value=as_of.year + 1, max_value=as_of.year + 30,
+                    value=max(as_of.year + 1, int(_asset_default(aid, "exit_cal"))), step=1,
+                    key=f"am_{aid}_exit_cal",
+                    help="Calendar year this position is exited. It sets the forecast horizon "
+                         "and the projection columns below.",
+                ))
+
+                mv_m = rv_m * (1 + adj_pct / 100)
+                exit_rel = max(1, exit_cal - as_of.year)
+                inv_year = inv_date.year if isinstance(inv_date, date) else as_of.year
+                hold_years = max(0, exit_cal - inv_year)
+
+                derived = pd.DataFrame([
+                    {"Line item": "Market Value (MV)", "Value": f"{mv_m:,.1f}"},
+                    {"Line item": "% of Fund RV", "Value": f"{(rv_m / total_rv * 100) if total_rv else 0:,.2f}%"},
+                    {"Line item": "Hold Period (yrs, from inv. date)", "Value": f"{hold_years}"},
+                    {"Line item": "Exit in forecast year", "Value": f"{exit_rel}"},
+                ])
+                st.dataframe(derived, width="stretch", hide_index=True)
+
+                with st.popover("Phased exit & fallback return"):
+                    st.caption(
+                        "By default the whole position is realised in the exit year above. Use "
+                        "these to split the exit across two years, or to set the flat return "
+                        "used when this asset model is switched off."
+                    )
+                    exit_pct_1 = st.number_input(
+                        "Exit % in the exit year", min_value=0.0, max_value=100.0, value=100.0,
+                        step=5.0, format="%.1f", key=f"am_{aid}_exit_pct_1",
+                    )
+                    exit_cal_2 = int(st.number_input(
+                        "Second exit year", min_value=as_of.year + 1, max_value=as_of.year + 30,
+                        value=max(as_of.year + 1, exit_cal), step=1, key=f"am_{aid}_exit_cal_2",
+                    ))
+                    exit_pct_2 = st.number_input(
+                        "Exit % of what's left, in that year", min_value=0.0, max_value=100.0,
+                        value=0.0, step=5.0, format="%.1f", key=f"am_{aid}_exit_pct_2",
+                    )
+                    expected_return_fallback = st.number_input(
+                        "Fallback Expected Return (%)", value=float(_asset_default(aid, "expected_return")),
+                        step=1.0, format="%.1f", key=f"am_{aid}_expected_return",
+                    )
+
+                st.markdown("**Entry Assumptions**")
+                e1, e2, e3 = st.columns(3)
+                entry_revenue = e1.number_input(
+                    "Entry Revenue ($mm)", min_value=0.0, value=float(_asset_default(aid, "entry_revenue")),
+                    step=0.1, format="%.1f", key=f"am_{aid}_entry_rev",
+                )
+                entry_margin = e2.number_input(
+                    "Entry EBITDA Margin (%)", min_value=0.0, max_value=100.0,
+                    value=COMMON_DEFAULTS["entry_ebitda_margin"], step=0.5, format="%.1f",
+                    key=f"am_{aid}_entry_margin",
+                )
+                entry_ev_mult = e3.number_input(
+                    "Entry EV/EBITDA (x)", min_value=0.0, value=COMMON_DEFAULTS["entry_ev_multiple"],
+                    step=0.5, format="%.1f", key=f"am_{aid}_entry_ev",
+                )
+                e4, e5 = st.columns(2)
+                entry_nd_mult = e4.number_input(
+                    "Entry Net Debt / EBITDA (x)", min_value=0.0,
+                    value=COMMON_DEFAULTS["entry_net_debt_ebitda"], step=0.25, format="%.2f",
+                    key=f"am_{aid}_entry_nd",
+                )
+                fund_ownership = e5.number_input(
+                    "Fund Ownership (%)", min_value=0.0, max_value=100.0,
+                    value=COMMON_DEFAULTS["fund_ownership"], step=1.0, format="%.1f",
+                    key=f"am_{aid}_ownership",
+                )
+
+                st.markdown("**Operating Projections ($mm)**")
+                default_ops = pd.DataFrame(
+                    [
+                        {"Line item": "Revenue Growth (%)",
+                         **{str(y): COMMON_DEFAULTS["revenue_growth"] for y in proj_years}},
+                        {"Line item": "EBITDA Margin (%)",
+                         **{str(y): COMMON_DEFAULTS["ebitda_margin"] for y in proj_years}},
+                        {"Line item": "FCF Conversion (% of EBITDA)",
+                         **{str(y): COMMON_DEFAULTS["fcf_conversion"] for y in proj_years}},
+                    ]
+                )
+                ops_df = st.data_editor(
+                    default_ops, width="stretch", hide_index=True, key=f"am_{aid}_ops",
+                    disabled=["Line item"],
+                )
+
+                def _row_vals(frame, label, fallback):
+                    match = frame[frame["Line item"] == label]
+                    if len(match) == 0:
+                        return [fallback / 100] * len(proj_years)
+                    r = match.iloc[0]
+                    out = []
+                    for y in proj_years:
+                        try:
+                            out.append(float(r[str(y)]) / 100)
+                        except (KeyError, TypeError, ValueError):
+                            out.append(fallback / 100)
+                    return out
+
+                growth_v = _row_vals(ops_df, "Revenue Growth (%)", COMMON_DEFAULTS["revenue_growth"])
+                margin_v = _row_vals(ops_df, "EBITDA Margin (%)", COMMON_DEFAULTS["ebitda_margin"])
+                conv_v = _row_vals(ops_df, "FCF Conversion (% of EBITDA)", COMMON_DEFAULTS["fcf_conversion"])
+
+                st.markdown("**Exit Valuation**")
+                exit_ev_mult = st.number_input(
+                    "Exit EV/EBITDA (x)", min_value=0.0, value=COMMON_DEFAULTS["exit_ev_multiple"],
+                    step=0.5, format="%.1f", key=f"am_{aid}_exit_ev",
+                )
+
+                build = asset_model_build(
+                    entry_revenue=entry_revenue,
+                    entry_ebitda_margin=entry_margin / 100,
+                    entry_ev_multiple=entry_ev_mult,
+                    entry_net_debt_ebitda=entry_nd_mult,
+                    fund_ownership_pct=fund_ownership / 100,
+                    years=proj_years,
+                    revenue_growth=growth_v,
+                    ebitda_margin=margin_v,
+                    fcf_conversion=conv_v,
+                    exit_year=exit_cal,
+                    exit_ev_multiple=exit_ev_mult,
+                )
+
+                # Entry block, computed -- shown under its inputs so the build reads top to bottom.
+                entry_calc = pd.DataFrame([
+                    {"Line item": "Entry EBITDA", "Value": build["entry_ebitda"]},
+                    {"Line item": "Entry Enterprise Value", "Value": build["entry_enterprise_value"]},
+                    {"Line item": "Entry Net Debt", "Value": build["entry_net_debt"]},
+                    {"Line item": "Entry Equity Value", "Value": build["entry_equity_value"]},
+                ])
+
+                sched = pd.DataFrame(build["schedule"])
+                ops_out = pd.DataFrame(
+                    [
+                        {"Line item": "Revenue", **{str(r["year"]): r["revenue"] for r in build["schedule"]}},
+                        {"Line item": "EBITDA", **{str(r["year"]): r["ebitda"] for r in build["schedule"]}},
+                        {"Line item": "Free Cash Flow", **{str(r["year"]): r["fcf"] for r in build["schedule"]}},
+                        {"Line item": "Net Debt - Beginning",
+                         **{str(r["year"]): r["net_debt_beginning"] for r in build["schedule"]}},
+                        {"Line item": "Less: Debt Paydown (FCF)",
+                         **{str(r["year"]): r["debt_paydown"] for r in build["schedule"]}},
+                        {"Line item": "Net Debt - Ending",
+                         **{str(r["year"]): r["net_debt_ending"] for r in build["schedule"]}},
+                    ]
+                )
+
+                if not build["exit_year_in_horizon"]:
+                    st.warning(
+                        f"Exit year {exit_cal} falls outside the projection columns "
+                        f"({proj_years[0]}-{proj_years[-1]}). Extend the forecast horizon by "
+                        "moving this company's Exit Year 1 inside it."
+                    )
+                exit_calc = pd.DataFrame([
+                    {"Line item": "Exit EBITDA", "Value": build["exit_ebitda"]},
+                    {"Line item": "Exit EV/EBITDA (x)", "Value": exit_ev_mult},
+                    {"Line item": "Exit Enterprise Value", "Value": build["exit_enterprise_value"]},
+                    {"Line item": "Less: Net Debt at Exit", "Value": build["net_debt_at_exit"]},
+                    {"Line item": "Exit Equity Value", "Value": build["exit_equity_value"]},
+                    {"Line item": "Fund Ownership (%)", "Value": fund_ownership},
+                    {"Line item": "Gross Proceeds to Fund ($mm)", "Value": build["gross_proceeds_to_fund"]},
+                ])
+
+                st.markdown("**Returns & Tie-Out**")
+                prior_proceeds = st.number_input(
+                    "Prior Fund Model Proceeds (hardcode)",
+                    value=float(_asset_default(aid, "prior_proceeds")), step=0.1,
+                    format="%.1f", key=f"am_{aid}_prior",
+                    help="What this asset's proceeds were in the last version of the fund model "
+                         "circulated. Kept as a hardcode so a re-run can be diffed against what "
+                         "the client last saw. Set to 0 to ignore.",
+                )
+                rets = asset_model_returns(
+                    build["gross_proceeds_to_fund"], cost_m, rv_m, hold_years,
+                    prior_proceeds if prior_proceeds != 0 else None,
+                )
+
+                # --- render the computed blocks, in the source model's order ---
+                st.markdown("_Entry Assumptions (computed)_")
+                st.dataframe(entry_calc.style.format({"Value": "{:,.3f}"}), width="stretch", hide_index=True)
+                st.markdown("_Operating Projections (computed)_")
+                st.dataframe(
+                    ops_out.style.format({str(y): "{:,.2f}" for y in proj_years}),
+                    width="stretch", hide_index=True,
+                )
+                st.markdown("_Exit Valuation (computed)_")
+                st.dataframe(exit_calc.style.format({"Value": "{:,.3f}"}), width="stretch", hide_index=True)
+
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric("Gross MOIC (vs Cost)",
+                          f"{rets['gross_moic_vs_cost']:.2f}x" if rets["gross_moic_vs_cost"] is not None else "NM")
+                r2.metric("Multiple on RV",
+                          f"{rets['multiple_on_rv']:.2f}x" if rets["multiple_on_rv"] is not None else "NM")
+                r3.metric("Gross IRR (annualised)",
+                          f"{rets['gross_irr_annualised']*100:.1f}%" if rets["gross_irr_annualised"] is not None else "NM")
+                r4.metric("Variance vs Prior",
+                          f"{rets['variance_vs_prior']:+,.2f}" if rets["variance_vs_prior"] is not None else "--")
+
+                st.markdown("**Cash Flow to Fund Model**")
+                cf_out = pd.DataFrame([
+                    {"Line item": "Exit Proceeds to Fund",
+                     **{str(r["year"]): r["exit_proceeds_to_fund"] for r in build["cash_flow_to_fund"]}},
+                ])
+                st.dataframe(
+                    cf_out.style.format({str(y): "{:,.2f}" for y in proj_years}),
+                    width="stretch", hide_index=True,
+                )
+                st.caption(
+                    "Fund-level $mm. The selling LP's share of this is what reaches the Cash Flow "
+                    f"Forecast tab: {lp_pct*100:.2f}% = "
+                    f"${build['gross_proceeds_to_fund'] * lp_pct:,.2f}mm in {exit_cal}."
+                )
+
+                asset_builds[name] = {
+                    "build": build, "returns": rets, "drives_forecast": drives,
+                    "exit_cal_year": exit_cal, "hold_years": hold_years, "cost_m": cost_m, "rv_m": rv_m,
+                }
+                # The portfolio table the fund-level forecast consumes is assembled here,
+                # from each company's own Deal Snapshot -- one source of truth, no separate
+                # table to keep in sync.
+                portfolio_rows.append({
+                    "Company": name,
+                    "Investment Date": inv_date,
+                    "Cost Basis ($M)": cost_m,
+                    "Reported Value ($M)": rv_m,
+                    "MV Adjustment (%)": adj_pct,
+                    "Expected Return (%)": expected_return_fallback,
+                    "Exit Year 1": exit_rel,
+                    "Exit % 1": exit_pct_1,
+                    "Exit Year 2": max(1, exit_cal_2 - as_of.year),
+                    "Exit % 2": exit_pct_2,
+                })
+
+# --------------------------------------------------------------------------
+# Remaining sidebar inputs
+# --------------------------------------------------------------------------
+# These sit here, after the Asset Model tab, because their controls depend on the
+# forecast horizon (remaining_years), which in portfolio mode is only known once
+# every company's exit year has been read above. st.sidebar.* writes to the sidebar
+# from anywhere in the script, so they still render in order under section 3.
 st.sidebar.header("4. Unfunded commitment")
 st.sidebar.write("Known follow-on investments (already identified):")
 default_followons = pd.DataFrame([
@@ -317,282 +679,6 @@ api_key = st.sidebar.text_input("Anthropic API key (optional)", type="password")
 st.sidebar.caption("No key? The assistant still answers using a rule-based summary of the numbers.")
 
 # --------------------------------------------------------------------------
-# Tabs
-# --------------------------------------------------------------------------
-# Created up front because the Asset Model tab is rendered FIRST, before the core
-# calculations below: each asset's bottom-up build is what sets that company's
-# expected return, so its inputs have to be read before the fund-level forecast
-# runs. Streamlit lets a tab be written into at any point in the script, so the
-# remaining tabs are filled in further down, after the numbers exist.
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Overview", "Cash Flow Forecast", "Secondary Pricing", "Asset Model (Bottom-up)", "AI Assistant"]
-)
-
-# --------------------------------------------------------------------------
-# Asset Model (Bottom-up) -- one full company model per portfolio holding
-# --------------------------------------------------------------------------
-# Per-asset defaults for the five current investments of the source deal. Anything
-# not listed here (a company you add to the portfolio table) gets a generic default
-# sized off its own Reported Value, so a new row never starts out absurd.
-ASSET_DEFAULTS = {
-    "Asset A": {"entry_revenue": 98.1, "prior_proceeds": 238.1},
-    "Asset B": {"entry_revenue": 68.8, "prior_proceeds": 214.2},
-    "Asset C": {"entry_revenue": 83.8, "prior_proceeds": 153.9},
-    "Asset D": {"entry_revenue": 102.4, "prior_proceeds": 282.5},
-    "Asset E": {"entry_revenue": 53.5, "prior_proceeds": 187.4},
-}
-COMMON_DEFAULTS = {
-    "entry_ebitda_margin": 25.0, "entry_ev_multiple": 11.0, "entry_net_debt_ebitda": 3.0,
-    "fund_ownership": 70.0, "exit_ev_multiple": 12.0, "revenue_growth": 8.0,
-    "ebitda_margin": 25.0, "fcf_conversion": 50.0,
-}
-
-asset_builds = {}  # company name -> {"build": ..., "returns": ..., "drives_forecast": bool}
-
-with tab4:
-    st.subheader("Asset Model (Bottom-up)")
-    if forecast_mode != "Portfolio companies (detailed)":
-        st.info(
-            "Switch **Forecast mode** to *Portfolio companies (detailed)* in the sidebar to "
-            "model each holding bottom-up. In Aggregate NAV mode the fund is projected off a "
-            "single NAV and runoff curve instead, so there are no individual assets to build."
-        )
-    elif portfolio_df is None or len(portfolio_df) == 0:
-        st.info("Add at least one company to the portfolio table in the sidebar.")
-    else:
-        st.caption(
-            "One model per holding, in $mm at fund level, laid out exactly like the source "
-            "workbook's per-asset tabs. Deal Snapshot is pulled from the portfolio table in the "
-            "sidebar (one source of truth for cost, marks and exit timing); everything below it "
-            "is set here. **Add or remove companies by adding or removing rows in that sidebar "
-            "table** -- a model appears here for each one automatically."
-        )
-        proj_years = [as_of.year + t for t in range(1, max(1, remaining_years) + 1)]
-        total_rv = float(portfolio_df["Reported Value ($M)"].sum())
-
-        for _, prow in portfolio_df.iterrows():
-            name = str(prow["Company"])
-            rv_m = float(prow["Reported Value ($M)"])
-            cost_m = float(prow.get("Cost Basis ($M)", 0.0))
-            adj_pct = float(prow["MV Adjustment (%)"])
-            mv_m = rv_m * (1 + adj_pct / 100)
-            exit_rel = int(prow["Exit Year 1"])
-            exit_cal = as_of.year + exit_rel
-            inv_date = prow.get("Investment Date")
-            try:
-                inv_year = pd.to_datetime(inv_date).year
-                inv_date_label = pd.to_datetime(inv_date).strftime("%Y-%m-%d")
-            except Exception:
-                inv_year = as_of.year
-                inv_date_label = "--"
-            hold_years = max(0, exit_cal - inv_year)
-
-            d = ASSET_DEFAULTS.get(name, {})
-            # A generic new company: entry equity x ownership lands near its Reported Value,
-            # so the implied return starts sane instead of wild.
-            default_revenue = d.get("entry_revenue", round(rv_m / 1.4, 1) if rv_m > 0 else 10.0)
-            default_prior = d.get("prior_proceeds", 0.0)
-
-            with st.expander(f"{name}", expanded=False):
-                drives = st.checkbox(
-                    "Use this asset model to drive the fund forecast", value=True,
-                    key=f"am_{name}_drives",
-                    help="On: this company's expected return in the forecast is whatever this "
-                         "model implies (its exit proceeds compounded back from today's Market "
-                         "Value). Off: the flat 'Expected Return (%)' from the sidebar table is "
-                         "used instead, and this model is display-only.",
-                )
-
-                st.markdown("**Deal Snapshot**")
-                snapshot = pd.DataFrame([
-                    {"Line item": "Investment Date", "Value": inv_date_label},
-                    {"Line item": "LP Cost ($mm, gross)", "Value": f"{cost_m:,.1f}"},
-                    {"Line item": "Reported Value (RV)", "Value": f"{rv_m:,.1f}"},
-                    {"Line item": "Market Value (MV)", "Value": f"{mv_m:,.1f}"},
-                    {"Line item": "% of Fund RV", "Value": f"{(rv_m / total_rv * 100) if total_rv else 0:,.2f}%"},
-                    {"Line item": "Exit Year", "Value": f"{exit_cal}"},
-                    {"Line item": "Hold Period (yrs, from inv. date)", "Value": f"{hold_years}"},
-                ])
-                st.dataframe(snapshot, width="stretch", hide_index=True)
-                st.caption(
-                    "Pulled from the sidebar portfolio table -- edit it there. Exit Year is that "
-                    f"row's Exit Year 1 ({exit_rel}) counted off the as-of date."
-                )
-
-                st.markdown("**Entry Assumptions**")
-                e1, e2, e3 = st.columns(3)
-                entry_revenue = e1.number_input(
-                    "Entry Revenue ($mm)", min_value=0.0, value=float(default_revenue), step=0.1,
-                    format="%.1f", key=f"am_{name}_entry_rev",
-                )
-                entry_margin = e2.number_input(
-                    "Entry EBITDA Margin (%)", min_value=0.0, max_value=100.0,
-                    value=COMMON_DEFAULTS["entry_ebitda_margin"], step=0.5, format="%.1f",
-                    key=f"am_{name}_entry_margin",
-                )
-                entry_ev_mult = e3.number_input(
-                    "Entry EV/EBITDA (x)", min_value=0.0, value=COMMON_DEFAULTS["entry_ev_multiple"],
-                    step=0.5, format="%.1f", key=f"am_{name}_entry_ev",
-                )
-                e4, e5 = st.columns(2)
-                entry_nd_mult = e4.number_input(
-                    "Entry Net Debt / EBITDA (x)", min_value=0.0,
-                    value=COMMON_DEFAULTS["entry_net_debt_ebitda"], step=0.25, format="%.2f",
-                    key=f"am_{name}_entry_nd",
-                )
-                fund_ownership = e5.number_input(
-                    "Fund Ownership (%)", min_value=0.0, max_value=100.0,
-                    value=COMMON_DEFAULTS["fund_ownership"], step=1.0, format="%.1f",
-                    key=f"am_{name}_ownership",
-                )
-
-                st.markdown("**Operating Projections ($mm)**")
-                default_ops = pd.DataFrame(
-                    [
-                        {"Line item": "Revenue Growth (%)",
-                         **{str(y): COMMON_DEFAULTS["revenue_growth"] for y in proj_years}},
-                        {"Line item": "EBITDA Margin (%)",
-                         **{str(y): COMMON_DEFAULTS["ebitda_margin"] for y in proj_years}},
-                        {"Line item": "FCF Conversion (% of EBITDA)",
-                         **{str(y): COMMON_DEFAULTS["fcf_conversion"] for y in proj_years}},
-                    ]
-                )
-                ops_df = st.data_editor(
-                    default_ops, width="stretch", hide_index=True, key=f"am_{name}_ops",
-                    disabled=["Line item"],
-                )
-
-                def _row_vals(frame, label, fallback):
-                    match = frame[frame["Line item"] == label]
-                    if len(match) == 0:
-                        return [fallback / 100] * len(proj_years)
-                    r = match.iloc[0]
-                    out = []
-                    for y in proj_years:
-                        try:
-                            out.append(float(r[str(y)]) / 100)
-                        except (KeyError, TypeError, ValueError):
-                            out.append(fallback / 100)
-                    return out
-
-                growth_v = _row_vals(ops_df, "Revenue Growth (%)", COMMON_DEFAULTS["revenue_growth"])
-                margin_v = _row_vals(ops_df, "EBITDA Margin (%)", COMMON_DEFAULTS["ebitda_margin"])
-                conv_v = _row_vals(ops_df, "FCF Conversion (% of EBITDA)", COMMON_DEFAULTS["fcf_conversion"])
-
-                st.markdown("**Exit Valuation**")
-                exit_ev_mult = st.number_input(
-                    "Exit EV/EBITDA (x)", min_value=0.0, value=COMMON_DEFAULTS["exit_ev_multiple"],
-                    step=0.5, format="%.1f", key=f"am_{name}_exit_ev",
-                )
-
-                build = asset_model_build(
-                    entry_revenue=entry_revenue,
-                    entry_ebitda_margin=entry_margin / 100,
-                    entry_ev_multiple=entry_ev_mult,
-                    entry_net_debt_ebitda=entry_nd_mult,
-                    fund_ownership_pct=fund_ownership / 100,
-                    years=proj_years,
-                    revenue_growth=growth_v,
-                    ebitda_margin=margin_v,
-                    fcf_conversion=conv_v,
-                    exit_year=exit_cal,
-                    exit_ev_multiple=exit_ev_mult,
-                )
-
-                # Entry block, computed -- shown under its inputs so the build reads top to bottom.
-                entry_calc = pd.DataFrame([
-                    {"Line item": "Entry EBITDA", "Value": build["entry_ebitda"]},
-                    {"Line item": "Entry Enterprise Value", "Value": build["entry_enterprise_value"]},
-                    {"Line item": "Entry Net Debt", "Value": build["entry_net_debt"]},
-                    {"Line item": "Entry Equity Value", "Value": build["entry_equity_value"]},
-                ])
-
-                sched = pd.DataFrame(build["schedule"])
-                ops_out = pd.DataFrame(
-                    [
-                        {"Line item": "Revenue", **{str(r["year"]): r["revenue"] for r in build["schedule"]}},
-                        {"Line item": "EBITDA", **{str(r["year"]): r["ebitda"] for r in build["schedule"]}},
-                        {"Line item": "Free Cash Flow", **{str(r["year"]): r["fcf"] for r in build["schedule"]}},
-                        {"Line item": "Net Debt - Beginning",
-                         **{str(r["year"]): r["net_debt_beginning"] for r in build["schedule"]}},
-                        {"Line item": "Less: Debt Paydown (FCF)",
-                         **{str(r["year"]): r["debt_paydown"] for r in build["schedule"]}},
-                        {"Line item": "Net Debt - Ending",
-                         **{str(r["year"]): r["net_debt_ending"] for r in build["schedule"]}},
-                    ]
-                )
-
-                if not build["exit_year_in_horizon"]:
-                    st.warning(
-                        f"Exit year {exit_cal} falls outside the projection columns "
-                        f"({proj_years[0]}-{proj_years[-1]}). Extend the forecast horizon by "
-                        "moving this company's Exit Year 1 inside it."
-                    )
-                exit_calc = pd.DataFrame([
-                    {"Line item": "Exit EBITDA", "Value": build["exit_ebitda"]},
-                    {"Line item": "Exit EV/EBITDA (x)", "Value": exit_ev_mult},
-                    {"Line item": "Exit Enterprise Value", "Value": build["exit_enterprise_value"]},
-                    {"Line item": "Less: Net Debt at Exit", "Value": build["net_debt_at_exit"]},
-                    {"Line item": "Exit Equity Value", "Value": build["exit_equity_value"]},
-                    {"Line item": "Fund Ownership (%)", "Value": fund_ownership},
-                    {"Line item": "Gross Proceeds to Fund ($mm)", "Value": build["gross_proceeds_to_fund"]},
-                ])
-
-                st.markdown("**Returns & Tie-Out**")
-                prior_proceeds = st.number_input(
-                    "Prior Fund Model Proceeds (hardcode)", value=float(default_prior), step=0.1,
-                    format="%.1f", key=f"am_{name}_prior",
-                    help="What this asset's proceeds were in the last version of the fund model "
-                         "circulated. Kept as a hardcode so a re-run can be diffed against what "
-                         "the client last saw. Set to 0 to ignore.",
-                )
-                rets = asset_model_returns(
-                    build["gross_proceeds_to_fund"], cost_m, rv_m, hold_years,
-                    prior_proceeds if prior_proceeds != 0 else None,
-                )
-
-                # --- render the computed blocks, in the source model's order ---
-                st.markdown("_Entry Assumptions (computed)_")
-                st.dataframe(entry_calc.style.format({"Value": "{:,.3f}"}), width="stretch", hide_index=True)
-                st.markdown("_Operating Projections (computed)_")
-                st.dataframe(
-                    ops_out.style.format({str(y): "{:,.2f}" for y in proj_years}),
-                    width="stretch", hide_index=True,
-                )
-                st.markdown("_Exit Valuation (computed)_")
-                st.dataframe(exit_calc.style.format({"Value": "{:,.3f}"}), width="stretch", hide_index=True)
-
-                r1, r2, r3, r4 = st.columns(4)
-                r1.metric("Gross MOIC (vs Cost)",
-                          f"{rets['gross_moic_vs_cost']:.2f}x" if rets["gross_moic_vs_cost"] is not None else "NM")
-                r2.metric("Multiple on RV",
-                          f"{rets['multiple_on_rv']:.2f}x" if rets["multiple_on_rv"] is not None else "NM")
-                r3.metric("Gross IRR (annualised)",
-                          f"{rets['gross_irr_annualised']*100:.1f}%" if rets["gross_irr_annualised"] is not None else "NM")
-                r4.metric("Variance vs Prior",
-                          f"{rets['variance_vs_prior']:+,.2f}" if rets["variance_vs_prior"] is not None else "--")
-
-                st.markdown("**Cash Flow to Fund Model**")
-                cf_out = pd.DataFrame([
-                    {"Line item": "Exit Proceeds to Fund",
-                     **{str(r["year"]): r["exit_proceeds_to_fund"] for r in build["cash_flow_to_fund"]}},
-                ])
-                st.dataframe(
-                    cf_out.style.format({str(y): "{:,.2f}" for y in proj_years}),
-                    width="stretch", hide_index=True,
-                )
-                st.caption(
-                    "Fund-level $mm. The selling LP's share of this is what reaches the Cash Flow "
-                    f"Forecast tab: {lp_pct*100:.2f}% = "
-                    f"${build['gross_proceeds_to_fund'] * lp_pct:,.2f}mm in {exit_cal}."
-                )
-
-                asset_builds[name] = {
-                    "build": build, "returns": rets, "drives_forecast": drives,
-                    "exit_cal_year": exit_cal, "hold_years": hold_years, "cost_m": cost_m, "rv_m": rv_m,
-                }
-
-# --------------------------------------------------------------------------
 # Core calculations
 # --------------------------------------------------------------------------
 # Fund -> LP scaling happens once, right here, for every fund-level $ figure
@@ -618,7 +704,7 @@ if forecast_mode == "Aggregate NAV (simple)":
 else:
     companies = []
     portfolio_display_rows = []
-    for _, row in portfolio_df.iterrows():
+    for row in portfolio_rows:
         rv = float(row["Reported Value ($M)"]) * 1_000_000
         adj = float(row["MV Adjustment (%)"]) / 100
         mv = reported_vs_market_value(rv, adj)

@@ -168,6 +168,64 @@ def everything(at):
 
 run_and_check("everything combined", everything)
 
+print("\n--- Deal Snapshot editing, add/remove, rename (behaviour, not just 'no crash') ---")
+
+
+def _portfolio_app():
+    at = AppTest.from_file("app.py", default_timeout=30)
+    at.run()
+    at.sidebar.radio[0].set_value("Portfolio companies (detailed)")
+    at.run()
+    return at
+
+
+def _metric(at, label):
+    hits = [m.value for m in at.metric if m.label == label]
+    assert hits, f"metric {label!r} not found"
+    return hits[0]
+
+
+def _check(label, cond, detail=""):
+    if cond:
+        print(f"  [PASS] {label}")
+    else:
+        print(f"  [FAIL] {label}  {detail}")
+        FAILS.append(label)
+
+
+at = _portfolio_app()
+nav_before = _metric(at, "Aggregate Reported Value")
+rv_input = [n for n in at.number_input if n.label == "Reported Value (RV, $mm)"][0]
+rv_input.set_value(200.0)
+at.run()
+_check("editing a company's Reported Value moves fund NAV on the same rerun",
+       _metric(at, "Aggregate Reported Value") == "$669,300,000",
+       f"{nav_before} -> {_metric(at, 'Aggregate Reported Value')}")
+
+at = _portfolio_app()
+exit_input = [n for n in at.number_input if n.label == "Exit Year"][0]
+exit_input.set_value(2035)
+at.run()
+_check("editing a company's Exit Year extends the forecast horizon",
+       _metric(at, "Forecast horizon").startswith("10 yrs"), _metric(at, "Forecast horizon"))
+
+at = _portfolio_app()
+[b for b in at.button if "Add a company" in b.label][0].click()
+at.run()
+added = _metric(at, "Companies")
+[b for b in at.button if b.label == "Remove"][0].click()
+at.run()
+_check("add / remove a company", added == "6" and _metric(at, "Companies") == "5",
+       f"after add={added}, after remove={_metric(at, 'Companies')}")
+
+at = _portfolio_app()
+moic_before = _metric(at, "Gross MOIC (vs Cost)")
+[t for t in at.text_input if t.label == "Company"][0].set_value("Project Falcon")
+at.run()
+_check("renaming a company keeps its model intact (stable widget ids)",
+       _metric(at, "Gross MOIC (vs Cost)") == moic_before,
+       f"{moic_before} -> {_metric(at, 'Gross MOIC (vs Cost)')}")
+
 print("\n=== SUMMARY ===")
 if FAILS:
     print(f"{len(FAILS)} FAILED: {FAILS}")

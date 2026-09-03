@@ -22,13 +22,15 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
 6. **Unfunded commitment generates its own return** (optional) — a future capital call isn't
    just an outflow; it funds a new investment that itself returns money. Turn this on to
    project a return (hold period + MOIC) on every future call.
-7. **Asset Model (Bottom-up)** — its own tab, with one full company model per holding, laid out
-   like a real per-asset tab: Deal Snapshot, Entry Assumptions, Operating Projections ($mm, with
-   per-year revenue growth / EBITDA margin / FCF conversion), Exit Valuation, Returns & Tie-Out,
-   and Cash Flow to Fund Model. Add or remove companies by adding rows to the portfolio table;
-   a model appears for each one. Each model backs out the annualized return that drives that
-   company in the fund forecast, and can be switched off per company to fall back to a flat
-   Expected Return %.
+7. **Asset Model (Bottom-up)** — its own tab, and the only place per-company inputs live: one
+   full model per holding, laid out like a real per-asset tab — Deal Snapshot (all editable:
+   name, investment date, cost, reported value, MV adjustment, exit year), Entry Assumptions,
+   Operating Projections ($mm, with per-year revenue growth / EBITDA margin / FCF conversion),
+   Exit Valuation, Returns & Tie-Out, and Cash Flow to Fund Model. Add or remove companies with
+   one click. Each model backs out the annualized return that drives that company in the fund
+   forecast, and can be switched off per company to fall back to a flat Expected Return %.
+   Fund NAV and the forecast horizon are derived from these snapshots, so there is no second
+   table to keep in sync.
 8. **Leverage overlay** (optional) — model the buyer financing part of the purchase price with
    a subscription-line/NAV facility, shown alongside (never in place of) the unlevered return.
 9. **Declining-balance waterfall + Analytics & Pricing Bridge** (optional) — an alternate,
