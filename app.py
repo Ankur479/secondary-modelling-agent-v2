@@ -13,7 +13,6 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from ai_agent import ask_agent
-from ic_review import risk_flags, scenario_companies
 from finance_engine import (
     apply_carry_waterfall,
     apply_carry_waterfall_declining_balance,
@@ -55,8 +54,8 @@ st.session_state.setdefault("premium_discount_pct", -10.0)
 # Terms holds the inputs and so must render before anything reads them; the
 # Investments grids must render before the Asset Model widgets they share state
 # with; and the schedules that depend on the fund forecast are appended last.
-tab_terms, tab_inv, tab_asset, tab_ic, tab_ai = st.tabs(
-    ["Deal Terms", "Investments", "Asset Model (Bottom-up)", "IC Review", "AI Assistant"]
+tab_terms, tab_inv, tab_asset, tab_ai = st.tabs(
+    ["Deal Terms", "Investments", "Asset Model (Bottom-up)", "AI Assistant"]
 )
 
 # --------------------------------------------------------------------------
@@ -1268,145 +1267,6 @@ seller_row_for_moic = secondary_pricing(net_nav, forecast_rows, as_of, [0.0], di
                                          unfunded_calls, unfunded_returns)[0]
 moic_unadjusted = to_date.tvpi
 moic_adjusted = seller_row_for_moic["moic"]
-
-# --------------------------------------------------------------------------
-# IC Review -- what the committee asks that one forecast can't answer
-# --------------------------------------------------------------------------
-# Two things only: how the price holds up if the deal goes badly, and what a careful
-# reviewer would circle. Deliberately not a memo writer -- the numbers belong to the
-# model, the argument belongs to whoever signs it.
-with tab_ic:
-    st.subheader("IC Review")
-
-    def _price_at(companies_scn):
-        """Run one scenario's portfolio all the way through to the buyer's return,
-        at the SAME price. You are buying at one number; the question is what that
-        number earns in each world, so the price is held and only the world moves."""
-        max_y = max(max(int(c["exit_year_1"]), int(c["exit_year_2"])) for c in companies_scn)
-        fee_override = None
-        if apply_fees and use_two_tier_fee:
-            fee_override = crossover_fee_schedule(
-                total_commitment=lp_commitment,
-                remaining_cost_by_year=remaining_cost_basis_by_year(companies_scn, max(1, max_y)),
-                crossover_year=crossover_year, fee_rate_initial=fee_rate_initial,
-                fee_rate_post=fee_rate_post)
-        rows = forecast_from_portfolio(
-            companies_scn, mgmt_fee_rate=mgmt_fee if apply_fees else 0.0, as_of=as_of,
-            fee_override_by_year=fee_override)
-        if apply_fees:
-            if waterfall_style == "Declining hurdle balance":
-                rows = apply_carry_waterfall_declining_balance(
-                    to_date.paid_in, to_date.distributions, rows, hurdle_rate, carry_rate,
-                    gp_catchup_rate)
-            else:
-                rows = apply_carry_waterfall(cf_dates, calls_lp, to_date.distributions, rows,
-                                             hurdle_rate, carry_rate)
-        calls_scn = build_unfunded_schedule(known_followons, blind_pool_amount * lp_pct,
-                                            blind_pool_years, rows)
-        returns_scn = {}
-        if unfunded_generates_return:
-            returns_scn, _ = build_unfunded_returns(calls_scn, unfunded_hold_years,
-                                                    unfunded_moic, rows)
-        priced = secondary_pricing(net_nav, rows, as_of, [buyer_target_discount],
-                                   distribution_key, calls_scn, returns_scn)[0]
-        return priced, rows
-
-    st.markdown("### If this goes badly")
-    sc1, sc2 = st.columns(2)
-    slip = int(sc1.number_input(
-        "Downside: exits slip by (years)", min_value=0, max_value=5, value=2, step=1,
-        help="A delayed process pays the same money later, which is a lower return -- "
-             "usually the single biggest driver of a disappointing secondary."))
-    haircut = sc2.number_input(
-        "Downside: exit proceeds light by (%)", min_value=0.0, max_value=90.0, value=25.0,
-        step=5.0, format="%.0f",
-        help="Roughly a turn off the exit multiple. Applied to what each exit pays, not "
-             "to today's mark -- the mark is inherited, the exit is the bet.") / 100
-
-    cases = [("Downside", slip, haircut), ("Base", 0, 0.0), ("Upside", 0, -0.15)]
-    rows_out, base_irr = [], None
-    for name, s, h in cases:
-        scn = scenario_companies(companies, exit_slip_years=s, proceeds_haircut=h)
-        priced, _rows = _price_at(scn)
-        if name == "Base":
-            base_irr = priced["irr"]
-        rows_out.append({
-            "Case": name,
-            "Exits slip": f"{s} yr" if s else "—",
-            "Proceeds": f"{-h:+.0%}" if h else "—",
-            "Price": priced["price"] / 1_000_000,
-            "IRR": priced["irr"],
-            "MOIC": priced["moic"],
-        })
-    scen_df = pd.DataFrame(rows_out)
-    st.dataframe(
-        scen_df.style.format({"Price": "{:,.2f}", "IRR": "{:.1%}", "MOIC": "{:.2f}x"}),
-        width="stretch", hide_index=True,
-    )
-    _down, _base, _up = rows_out[0], rows_out[1], rows_out[2]
-    st.caption(
-        f"All three at the same price (${_base['Price']:,.2f}mm, the "
-        f"{-premium_discount*100:.0f}% discount quoted in the sidebar) — only the world "
-        f"changes. On the downside as set above the buyer earns "
-        f"{_down['IRR']*100:.1f}% and {_down['MOIC']:.2f}x, against "
-        f"{_base['IRR']*100:.1f}% and {_base['MOIC']:.2f}x in the base case. "
-        "That gap is the number to argue about, not the base case on its own."
-    )
-    if _down["MOIC"] < 1.0:
-        st.warning(
-            f"The downside case returns less than cost ({_down['MOIC']:.2f}x). At this "
-            "price the deal needs the base case to be roughly right."
-        )
-
-    st.markdown("### What a reviewer would ask")
-    _company_values = {p["name"]: p["mv_m"] for p in precomputed.values()} if precomputed else {}
-    _proceeds_by_year = {}
-    for _r in forecast_rows:
-        _proceeds_by_year[as_of.year + _r["year"]] = _r.get(distribution_key, 0.0)
-    _blind_only = build_unfunded_schedule([], blind_pool_amount * lp_pct, blind_pool_years,
-                                          forecast_rows)
-    _blind_proceeds = 0.0
-    if unfunded_generates_return:
-        _blind_proceeds = sum(build_unfunded_returns(_blind_only, unfunded_hold_years,
-                                                     unfunded_moic, forecast_rows)[0].values())
-    _flags = risk_flags(
-        as_of=as_of, company_values=_company_values, proceeds_by_year=_proceeds_by_year,
-        purchase_price=buyer_row["price"], unfunded=total_unfunded,
-        blind_pool_proceeds=_blind_proceeds,
-        total_proceeds=sum(r[distribution_key] for r in forecast_rows) + total_unfunded_return,
-        carry_taken=sum(r.get("gp_carry", 0.0) for r in forecast_rows),
-    )
-    if not _flags:
-        st.success("Nothing flagged: the mark is current, the book is spread, and the "
-                   "return doesn't hang on any single year or assumption.")
-    for _f in _flags:
-        _msg = f"**{_f['title']}** — {_f['detail']}"
-        if _f["level"] == "serious":
-            st.error(_msg)
-        elif _f["level"] == "watch":
-            st.warning(_msg)
-        else:
-            st.info(_msg)
-    st.caption(
-        "Every flag is computed from this model, and each one shows the number that "
-        "triggered it — so the threshold is the thing to argue with, not the tool. "
-        "Silence here is not diligence; it only means nothing crossed these particular "
-        "lines."
-    )
-
-    st.markdown("### Return and timing")
-    tm1, tm2, tm3 = st.columns(3)
-    tm1.metric("MV CAGR (projected growth)", f"{mv_cagr*100:.1f}%")
-    tm2.metric("Cash-flow duration", f"{cf_duration_years:.2f} yrs")
-    tm3.metric("RV / MV multiple", f"{rv_mv_multiple:.2f}x" if rv_mv_multiple else "n/a")
-    st.caption(
-        "MV CAGR: the flat annual rate that takes today's net NAV to the projected total "
-        "value over the duration below. Cash-flow duration: the distribution-weighted "
-        "average wait for money to come back — the number to hold next to the IRR, since "
-        "a high IRR over two years and over eight are different propositions. RV/MV: how "
-        "far the buyer's own marks sit from the GP's."
-    )
-
 
 # --------------------------------------------------------------------------
 # Pricing panel -- the source model's pricing block, live in the sidebar
