@@ -42,8 +42,28 @@ An AI agent for **PE secondaries (LP stake) modelling**, packaged as a Streamlit
     Current Investments (Company Name, Inv. Date, % of RV, % of MV, Cost, RV, MV Adjustment, MV,
     a column per forecast year, Proceeds) and Post-Report Investments below it, each with a
     Fund-level and an LP-level dropdown. The LP view carries LP Cost / LP RV / LP MV / LP
-    Proceeds / LP MOIC — the same schedule at the selling LP's ownership.
-11. **Two-tier ("step-down") management fee** (optional, Portfolio companies mode) — mirrors a
+    Proceeds / LP MOIC — the same schedule at the selling LP's ownership. Each Fund-level
+    view is **one editable schedule**, not an input table plus an output table: white columns
+    take input, shaded ones are computed from it. Set a count and press Add to get that many
+    rows in a single click, or delete rows in place. Those edits are the same store the Asset
+    Model tab's Deal Snapshot writes to, so editing in either place updates both, and the Fund
+    and LP views are two renderings of one list — their company counts can never diverge.
+11. **Funded & Unfunded Commitment blocks** — below the two investment blocks, the fund
+    model's own walk down to net proceeds, line for line: Current Investments, Net Cash,
+    Management fees, Proceeds after management fees, Future Carried Interest, Accrued
+    Carried Interest, Tax Blocker Leakage, Proceeds after carried interest; then Post-Report
+    Date Investments, their carry, Drawdown on remaining unfunded, and Return on Remaining
+    Unfunded. Fund-level and LP-level dropdowns on each. These present the app's own forecast
+    in that row order rather than recomputing it — "Proceeds after management fees" *is* the
+    distribution the pricing tab uses.
+12. **Fees and carry, explained** — under those blocks, the same two mechanics in three
+    registers: a sentence in plain English built from the actual numbers ("the GP earns
+    nothing until … on this forecast that happens in 2029"), a chart of what the fee is
+    charged on and when the hurdle clears, and the year-by-year workings (hurdle balance,
+    preferred accrued, distributions applied, carry entitlement) for anyone checking it line
+    by line. The carry shown is read off the waterfall that produced the forecast, so the
+    explanation can never disagree with the numbers.
+13. **Two-tier ("step-down") management fee** (optional, Portfolio companies mode) — mirrors a
     common real fund schedule: a flat rate on the fund's total commitment during the investment
     period, then from a chosen crossover year onward, a (usually lower) rate on each company's
     remaining invested cost basis, which shrinks as companies exit. The default flat fee-on-NAV
