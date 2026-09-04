@@ -11,8 +11,6 @@ Run: python3 smoke_test_app.py
 """
 from streamlit.testing.v1 import AppTest
 
-from voice_commands import describe, parse_command
-
 FAILS = []
 
 
@@ -358,46 +356,6 @@ if ladder is not None:
     _check("IRR rises as the price falls, across the whole ladder",
            all(a < b for a, b in zip(irrs, irrs[1:])), irrs)
 
-
-# ===========================================================================
-print("\n--- Voice control changes the model, visibly ---")
-# ===========================================================================
-# The mic itself can't be driven headlessly, so this exercises everything behind it:
-# the same parse the app runs on a transcript, the same write into session state, and
-# the effect that write has on the numbers.
-at = _app()
-assets = [{"aid": a, "name": at.session_state[f"am_{a}_name"]}
-          for a in at.session_state["asset_ids"]]
-
-irr_before = _metric(at, "Buyer IRR at this price")
-c = parse_command("set the discount to twenty five percent", assets, at.session_state)
-_check("a spoken discount is understood, and quoted as a negative premium",
-       c is not None and c["key"] == "premium_discount_pct" and c["value"] == -25.0, c)
-_check("the change is described with both the old and new value",
-       describe(c) == "Premium / (Discount) to Reported Value: -10% → -25%", describe(c))
-at.session_state[c["key"]] = c["value"]
-at.run()
-_check("applying it reprices the deal",
-       _metric(at, "Buyer IRR at this price") != irr_before
-       and float(_metric(at, "Buyer IRR at this price").rstrip("%")) > float(irr_before.rstrip("%")),
-       (irr_before, _metric(at, "Buyer IRR at this price")))
-
-at = _app()
-c = parse_command("asset a exit year 2033", assets, at.session_state)
-_check("a spoken exit year targets that asset", c is not None and c["key"] == "am_A_exit_cal", c)
-at.session_state[c["key"]] = int(c["value"])
-at.run()
-_check("and moves the forecast horizon with it",
-       _metric(at, "Forecast horizon").startswith("8 yrs"), _metric(at, "Forecast horizon"))
-
-at = _app()
-before = at.session_state["premium_discount_pct"]
-_check("a sentence with no number changes nothing",
-       parse_command("push the discount out a bit", assets, at.session_state) is None)
-_check("an out-of-range value is refused rather than clamped",
-       parse_command("discount 250 percent", assets, at.session_state) is None)
-_check("state is untouched by a refused command",
-       at.session_state["premium_discount_pct"] == before)
 
 print("\n=== SUMMARY ===")
 if FAILS:

@@ -32,18 +32,6 @@ margin and FCF conversion), Exit Valuation, Returns & Tie-Out, Cash Flow to Fund
 model backs out the annualised return that drives its company in the fund forecast, and can be
 switched off per company to fall back to a flat expected return.
 
-**Voice control (sidebar)** — speak a change instead of typing it: *"discount fifteen
-percent"*, *"carry twenty"*, *"asset D exit year 2031"*, *"asset A cost ninety"*. Useful in
-the moment it was built for — flexing assumptions on a call or in front of a client without
-looking away from the screen. Three things make it safe to use on a live model: it is scoped
-to the handful of knobs that actually get flexed, so it can't wander into the wrong field; it
-refuses anything it isn't sure of rather than guessing (no number, unknown field, out-of-range
-value, a year not spoken in full); and it never changes anything silently — what it heard and
-what it changed are shown with an Undo. Assets answer to their letter as well as their name,
-so a deal can be flexed out loud without saying the company or the fund. Audio is sent away
-for transcription, so treat it like a browser search box; if the package isn't installed the
-feature simply hides and everything else works.
-
 **AI Assistant** — ask a question in plain language; it answers from the exact numbers the
 engine computed. Works with an Anthropic API key, or without one via a deterministic summary.
 
@@ -75,8 +63,7 @@ a ladder of alternative prices underneath.
   leverage overlay and secondary pricing
 - `ai_agent.py` — AI agent wrapper (Claude + deterministic fallback)
 - `sample_fund_cashflows.csv` — sample fund history so the app runs out of the box
-- `voice_commands.py` — the spoken-command grammar (pure Python, no Streamlit)
-- `smoke_test_app.py` — 65 behaviour checks driven through the real widgets
+- `smoke_test_app.py` — 57 behaviour checks driven through the real widgets
 - `test_*.py` — engine tests, including `test_v5_asset_model.py`, which pins every asset to the
   source workbook's own recalculated values, and `test_v6_rollforward.py` for the carry workings
 

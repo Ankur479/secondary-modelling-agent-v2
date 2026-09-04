@@ -2,5 +2,3 @@ streamlit>=1.32
 pandas>=2.0
 plotly>=5.18
 anthropic>=0.30
-streamlit-mic-recorder>=0.0.8
-SpeechRecognition>=3.10

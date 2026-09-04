@@ -13,7 +13,6 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from ai_agent import ask_agent
-from voice_commands import describe, parse_command
 from finance_engine import (
     apply_carry_waterfall,
     apply_carry_waterfall_declining_balance,
@@ -40,98 +39,13 @@ st.title("Secondary Market Modelling Agent")
 st.caption("AI-assisted valuation and cash-flow forecasting for LP secondary transactions")
 
 # --------------------------------------------------------------------------
-# Voice control -- speak a change instead of typing it
+# Widget defaults
 # --------------------------------------------------------------------------
-# This runs before every widget it can touch, because Streamlit only allows writing a
-# widget's key before that widget is instantiated on the run. Nothing is ever applied
-# silently: what was heard and what it changed are shown, with an undo, because a
-# misheard digit that quietly repriced a deal would be worse than no voice control.
+# Seeded here, before the widgets are created, so each one opens on its intended
+# value rather than falling back to its minimum.
 st.session_state.setdefault("carry_pct", 20.0)
 st.session_state.setdefault("hurdle_pct", 8.0)
 st.session_state.setdefault("premium_discount_pct", -10.0)
-st.session_state.setdefault("voice_last", None)
-st.session_state.setdefault("voice_undo", None)
-
-try:
-    from streamlit_mic_recorder import speech_to_text
-    _VOICE_AVAILABLE = True
-except Exception:  # pragma: no cover - depends on the deployment having the package
-    _VOICE_AVAILABLE = False
-
-with st.sidebar:
-    st.header("Voice")
-    if not _VOICE_AVAILABLE:
-        st.caption(
-            "Voice control needs the `streamlit-mic-recorder` package. Everything else "
-            "works without it -- add it to requirements.txt to switch this on."
-        )
-    else:
-        _heard = speech_to_text(language="en", just_once=True, use_container_width=True,
-                                start_prompt="🎙 Speak a change", stop_prompt="■ Stop",
-                                key="voice_stt")
-        if _heard:
-            # Read the asset list straight from state rather than through the helpers
-            # defined further down -- this block has to run before them.
-            _assets = [
-                {"aid": aid,
-                 "name": str(st.session_state.get(f"am_{aid}_name", f"Asset {aid}"))}
-                for aid in st.session_state.get("asset_ids", ["A", "B", "C", "D", "E"])
-            ]
-            _change = parse_command(_heard, _assets, st.session_state)
-            if _change is None:
-                st.session_state["voice_last"] = {"heard": _heard, "change": None}
-            else:
-                # Growth is a per-year vector, so it is set across every year at once;
-                # everything else is a single field.
-                if _change["key"].endswith("_growth_pct"):
-                    _aid = _change["asset"]
-                    _store = st.session_state.get(f"am_{_aid}_ops_store")
-                    _old = None
-                    if isinstance(_store, dict) and _store.get("growth"):
-                        _old = _store["growth"][0]
-                        _new = dict(_store)
-                        _new["growth"] = [_change["value"]] * len(_store["growth"])
-                        st.session_state["voice_undo"] = {
-                            "key": f"am_{_aid}_ops_store", "value": _store}
-                        st.session_state[f"am_{_aid}_ops_store"] = _new
-                    _change["old_value"] = _old
-                else:
-                    st.session_state["voice_undo"] = {
-                        "key": _change["key"], "value": st.session_state.get(_change["key"])}
-                    st.session_state[_change["key"]] = (
-                        int(_change["value"]) if _change["unit"] == "year" else _change["value"])
-                st.session_state["voice_last"] = {"heard": _heard, "change": _change}
-            st.rerun()
-
-        _last = st.session_state.get("voice_last")
-        if _last:
-            st.caption(f"Heard: “{_last['heard']}”")
-            if _last["change"] is None:
-                st.warning("Didn't catch a change in that.")
-            else:
-                st.success(describe(_last["change"]))
-                if st.session_state.get("voice_undo") and st.button("Undo", key="voice_undo_btn"):
-                    _u = st.session_state.pop("voice_undo")
-                    st.session_state[_u["key"]] = _u["value"]
-                    st.session_state["voice_last"] = None
-                    st.rerun()
-
-        with st.expander("What it understands"):
-            st.markdown(
-                "- *“discount fifteen percent”* · *“premium of five”*\n"
-                "- *“carry twenty”* · *“preferred return ten percent”*\n"
-                "- *“asset D exit year 2031”* · *“asset A cost ninety”*\n"
-                "- *“asset B reported value 200”* · *“asset C growth twelve percent”*\n\n"
-                "Assets answer to their letter as well as their name, so a deal can be "
-                "flexed out loud without saying the company or the fund. Say a year in "
-                "full — “2031”, not “31”. Anything it isn't sure of, it refuses rather "
-                "than guesses."
-            )
-            st.caption(
-                "Audio is sent away for transcription, so treat it like a browser search "
-                "box: the commands above need no confidential words."
-            )
-
 
 # --------------------------------------------------------------------------
 # Tabs
