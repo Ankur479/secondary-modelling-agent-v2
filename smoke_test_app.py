@@ -357,6 +357,51 @@ if ladder is not None:
            all(a < b for a, b in zip(irrs, irrs[1:])), irrs)
 
 
+# ===========================================================================
+print("\n--- IC Review: scenarios and risk flags ---")
+# ===========================================================================
+at = _app()
+scen = next((d.value for d in at.dataframe if "Case" in list(d.value.columns)), None)
+_check("the scenario table renders", scen is not None)
+if scen is not None:
+    _check("three cases, worst first",
+           list(scen["Case"]) == ["Downside", "Base", "Upside"], list(scen["Case"]))
+    _check("all three are priced at the SAME price -- only the world changes",
+           len(set(round(float(p), 6) for p in scen["Price"])) == 1, list(scen["Price"]))
+    irrs = [float(x) for x in scen["IRR"]]
+    moics = [float(x) for x in scen["MOIC"]]
+    _check("IRR rises from downside to upside", irrs[0] < irrs[1] < irrs[2], irrs)
+    _check("MOIC rises with it", moics[0] < moics[1] < moics[2], moics)
+    _check("the base case matches the sidebar's headline IRR",
+           abs(irrs[1] * 100 - float(_metric(at, "Buyer IRR at this price").rstrip("%"))) < 0.1,
+           (irrs[1], _metric(at, "Buyer IRR at this price")))
+
+# Harsher downside levers must push the downside further down, not anywhere else.
+base_down = None
+if scen is not None:
+    base_down = float(scen["IRR"][0])
+at = _app()
+_num(at, "Downside: exits slip by (years)").set_value(4)
+at.run()
+scen2 = next((d.value for d in at.dataframe if "Case" in list(d.value.columns)), None)
+_check("a longer slip lowers the downside IRR further",
+       scen2 is not None and float(scen2["IRR"][0]) < base_down,
+       (base_down, None if scen2 is None else float(scen2["IRR"][0])))
+_check("and leaves the base case untouched",
+       scen2 is not None and abs(float(scen2["IRR"][1]) - float(scen["IRR"][1])) < 1e-9)
+
+at = _app()
+flags = [w.value for w in at.warning] + [e.value for e in at.error]
+_check("the deal's real risks are flagged", len(flags) >= 2, flags)
+_check("a nine-month-old mark is caught",
+       any("more than six months old" in f for f in flags), flags)
+_check("unfunded being most of the price is caught",
+       any("Unfunded is" in f and "purchase price" in f for f in flags), flags)
+_check("reliance on the blind pool is caught",
+       any("blind pool" in f for f in flags), flags)
+_check("every flag carries the number that triggered it",
+       all("%" in f or "months" in f or "x the" in f for f in flags), flags)
+
 print("\n=== SUMMARY ===")
 if FAILS:
     print(f"{len(FAILS)} FAILED: {FAILS}")

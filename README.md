@@ -6,7 +6,7 @@ It follows the order a secondaries analyst actually works in: set the terms, bui
 from the bottom up, read the investment schedule that falls out of it, and watch the price move
 while you do — the pricing panel is pinned to the sidebar, so it is never more than a glance away.
 
-## The four tabs
+## The tabs
 
 **Deal Terms** — the term sheet, in the two blocks a fund model uses. *Deal Terms*: currency,
 report date, market value date, closing date. *Fund Terms*: vintage, carried interest, preferred
@@ -31,6 +31,17 @@ Snapshot, Entry Assumptions, Operating Projections ($mm, with per-year revenue g
 margin and FCF conversion), Exit Valuation, Returns & Tie-Out, Cash Flow to Fund Model. Each
 model backs out the annualised return that drives its company in the fund forecast, and can be
 switched off per company to fall back to a flat expected return.
+
+**IC Review** — the two things a committee asks that one forecast can't answer.
+*If this goes badly*: Downside / Base / Upside, all priced at the **same** price — you are
+buying at one number, so only the world changes. The downside levers are the two that
+actually hurt a secondary: exits slipping (the same money later is a lower return) and exits
+paying light. *What a reviewer would ask*: flags computed from the model itself — a stale
+mark, a name that is too much of the book, unfunded larger than the price, proceeds bunched
+into one year, a return leaning on the blind pool. Each flag carries the number that
+triggered it, so the threshold is the thing to argue with rather than the tool. It stops
+short of writing the memo: the numbers belong to the model, the argument belongs to whoever
+signs it.
 
 **AI Assistant** — ask a question in plain language; it answers from the exact numbers the
 engine computed. Works with an Anthropic API key, or without one via a deterministic summary.
@@ -63,7 +74,8 @@ a ladder of alternative prices underneath.
   leverage overlay and secondary pricing
 - `ai_agent.py` — AI agent wrapper (Claude + deterministic fallback)
 - `sample_fund_cashflows.csv` — sample fund history so the app runs out of the box
-- `smoke_test_app.py` — 57 behaviour checks driven through the real widgets
+- `ic_review.py` — scenario re-cuts and the risk flags (pure Python)
+- `smoke_test_app.py` — 70 behaviour checks driven through the real widgets
 - `test_*.py` — engine tests, including `test_v5_asset_model.py`, which pins every asset to the
   source workbook's own recalculated values, and `test_v6_rollforward.py` for the carry workings
 
