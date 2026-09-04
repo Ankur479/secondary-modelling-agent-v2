@@ -370,6 +370,117 @@ _check("adding a post-report investment shows up in both its views",
        counts[3] == 2 and counts[4] == 3, f"post-report table rows={counts[3:]}")
 _check("no exceptions across any of the grid edits", not at.exception, at.exception)
 
+print("\n--- Funded / Unfunded Commitment blocks and the fees-and-carry explainer ---")
+
+
+def _line_tables(at):
+    return [d.value for d in at.dataframe if "Line item" in list(d.value.columns)]
+
+
+at = _portfolio_app()
+lts = _line_tables(at)
+funded = next((t for t in lts if "Proceeds after carried Interest" in list(t["Line item"])), None)
+unfunded = next((t for t in lts if "Unfunded Commitment" in list(t["Line item"])), None)
+_check("the Funded Commitment block renders", funded is not None)
+_check("the Unfunded Commitment block renders", unfunded is not None)
+
+if funded is not None:
+    items = list(funded["Line item"])
+    _check("Funded Commitment carries every line of the source model, in its order",
+           items == ["Current Investments", "Net Cash", "Management fees",
+                     "Proceeds after management fees",
+                     "Future Carried Interest on Funded Commitment",
+                     "Accrued Carried Interest to Date", "Tax Blocker Leakage",
+                     "Proceeds after carried Interest"], items)
+
+    def _row(t, name):
+        return t[t["Line item"] == name].iloc[0]
+
+    cur = _row(funded, "Current Investments")
+    _check("Current Investments cost/RV tie to the portfolio (426.4 / 657.3)",
+           abs(float(cur["Cost"]) - 426.4) < 0.05 and abs(float(cur["RV"]) - 657.3) < 0.05,
+           (cur["Cost"], cur["RV"]))
+
+    cash = _row(funded, "Net Cash")
+    year_cols = [c for c in funded.columns if c.isdigit()]
+    _check("Net Cash is a balance-sheet line: value columns only, no cash flow",
+           float(cash["RV"]) == 0.7 and all(float(cash[c]) == 0.0 for c in year_cols),
+           (cash["RV"], [float(cash[c]) for c in year_cols]))
+    _check("Net Cash lifts reported value to the fund's 658.0",
+           abs(float(_row(funded, "Proceeds after management fees")["RV"]) - 658.0) < 0.05,
+           _row(funded, "Proceeds after management fees")["RV"])
+
+    # The block is a presentation of the app's own forecast, not a second calculation:
+    # gross proceeds less the fee borne by them must land back on the distributions the
+    # pricing tab uses.
+    fees = _row(funded, "Management fees")
+    after = _row(funded, "Proceeds after management fees")
+    _check("Current Investments + Net Cash + fees == Proceeds after management fees",
+           all(abs((float(cur[c]) + float(cash[c]) + float(fees[c])) - float(after[c])) < 1e-6
+               for c in year_cols))
+    _check("management fees are negative",
+           float(fees["Proceeds"]) < 0, fees["Proceeds"])
+
+    carry = _row(funded, "Future Carried Interest on Funded Commitment")
+    final = _row(funded, "Proceeds after carried Interest")
+    accrued = _row(funded, "Accrued Carried Interest to Date")
+    blocker = _row(funded, "Tax Blocker Leakage")
+    _check("after-fees less carry, accrued carry and blocker == final proceeds",
+           all(abs((float(after[c]) + float(carry[c]) + float(accrued[c]) + float(blocker[c]))
+                   - float(final[c])) < 1e-6 for c in year_cols))
+
+if unfunded is not None:
+    items = list(unfunded["Line item"])
+    _check("Unfunded Commitment carries every line of the source model, in its order",
+           items == ["Post-Report Date Investments",
+                     "Carried Interest on Post-Report Investments",
+                     "Drawdown on remaining unfunded", "Return on Remaining Unfunded",
+                     "Unfunded Commitment"], items)
+    post = unfunded[unfunded["Line item"] == "Post-Report Date Investments"].iloc[0]
+    pcarry = unfunded[unfunded["Line item"] == "Carried Interest on Post-Report Investments"].iloc[0]
+    ret = unfunded[unfunded["Line item"] == "Return on Remaining Unfunded"].iloc[0]
+    draw = unfunded[unfunded["Line item"] == "Drawdown on remaining unfunded"].iloc[0]
+    # 90 in, 157.5 back -> 67.5 profit -> 20% carry = 13.5
+    _check("carry on post-report investments is 20% of their profit (13.5)",
+           abs(float(pcarry["Proceeds"]) + 13.5) < 1e-6, pcarry["Proceeds"])
+    _check("the blind pool is drawn in full (-374.8)",
+           abs(float(draw["Proceeds"]) + 374.8) < 0.05, draw["Proceeds"])
+    _check("the blind pool returns at the assumed 1.75x (655.9)",
+           abs(float(ret["Proceeds"]) - 655.9) < 0.05, ret["Proceeds"])
+
+# --- the explainer ---
+roll = next((d.value for d in at.dataframe
+             if "Hurdle balance, opening" in list(d.value.columns)), None)
+_check("the year-by-year carry workings render", roll is not None)
+if roll is not None and funded is not None:
+    # The workings must agree with the block they explain: total carry in the roll-forward,
+    # grossed to fund level, is the Future Carry line.
+    lp_share = float(at.session_state["lp_commitment"]) / float(at.session_state["fund_commitment"]) \
+        if "lp_commitment" in at.session_state else None
+    total_carry_lp = float(roll["Carry in year"].sum())
+    carry_line = abs(float(_row(funded, "Future Carried Interest on Funded Commitment")["Proceeds"]))
+    if lp_share:
+        _check("roll-forward carry equals the Funded Commitment carry line",
+               abs(total_carry_lp / lp_share / 1e6 - carry_line) < 0.01,
+               (total_carry_lp / lp_share / 1e6, carry_line))
+    _check("no carry is taken while the hurdle is still open",
+           all(r["Carry in year"] == 0 for _, r in roll.iterrows()
+               if r["Hurdle balance, closing"] > 1e-6))
+
+# Declining-balance style must produce a preferred-return column that actually accrues.
+at2 = _portfolio_app()
+[r for r in at2.sidebar.radio if "hurdle balance" in str(r.options)][0].set_value("Declining hurdle balance")
+at2.run()
+roll2 = next((d.value for d in at2.dataframe
+              if "Hurdle balance, opening" in list(d.value.columns)), None)
+_check("declining-balance workings accrue a preferred return",
+       roll2 is not None and float(roll2["Preferred return accrued"].sum()) > 0,
+       None if roll2 is None else roll2["Preferred return accrued"].sum())
+_check("the explainer names the year carry starts and the rate, from the real numbers",
+       any("On this forecast that happens in" in md.value and "20%" in md.value
+           for md in at2.markdown),
+       [md.value[:80] for md in at2.markdown if "forecast that happens" in md.value])
+
 print("\n=== SUMMARY ===")
 if FAILS:
     print(f"{len(FAILS)} FAILED: {FAILS}")

@@ -20,6 +20,7 @@ from finance_engine import (
     asset_model_returns,
     build_unfunded_returns,
     build_unfunded_schedule,
+    carry_rollforward,
     cash_flow_duration,
     crossover_fee_schedule,
     forecast_cashflows,
@@ -1491,6 +1492,378 @@ if forecast_mode == "Portfolio companies (detailed)" and blind_pool_amount > 0:
             f"drawn over {blind_pool_years} year(s). It isn't a line here because it isn't a "
             "named investment yet -- it flows through the Cash Flow Forecast."
         )
+
+# --------------------------------------------------------------------------
+# Funded & Unfunded Commitment -- the source model's two summary blocks
+# --------------------------------------------------------------------------
+# These take the two investment blocks above and walk them down to net proceeds:
+# fees, carry and cash on the funded side; the post-report investments, their carry
+# and the remaining drawdown on the unfunded side. Every line is the app's own
+# forecast presented in the workbook's row order, not a second calculation -- the
+# "Proceeds after management fees" line IS the distribution the pricing tab uses.
+if forecast_mode == "Portfolio companies (detailed)" and forecast_rows:
+
+    def _fund(x):
+        """LP-level engine output -> fund level, in $mm."""
+        return (x / lp_pct / 1_000_000) if lp_pct else 0.0
+
+    def _lp_mm(x):
+        """LP-level engine output -> $mm, still at the LP's share."""
+        return x / 1_000_000
+
+    # The engine charges the management fee inside the NAV roll-forward, so a year's
+    # distribution is already net of it. To show fees on their own line the way the
+    # workbook does, split that year's distribution back into its pre-fee amount and
+    # the fee borne by it: fee_ratio is exactly what the engine applied.
+    fee_lines = []
+    for r in forecast_rows:
+        grown = r.get("grown_nav", 0.0)
+        fee = r.get("mgmt_fee", 0.0)
+        ratio = ((grown - fee) / grown) if grown > 0 else 1.0
+        dist = r.get("gross_distribution", 0.0)
+        pre_fee = (dist / ratio) if ratio > 0 else dist
+        fee_lines.append({
+            "year": r["year"],
+            "pre_fee_distribution": pre_fee,
+            "fee_on_distribution": pre_fee - dist,
+            "fee_total": fee,
+            "distribution": dist,
+            "gp_carry": r.get("gp_carry", 0.0),
+            "lp_distribution": r.get("lp_distribution", dist),
+        })
+    total_dist = sum(f["distribution"] for f in fee_lines) or 1.0
+
+    with tab3:
+        st.markdown("### Funded Commitment")
+        fc_fund_exp = st.expander("Fund level", expanded=True)
+        fc_lp_exp = st.expander("LP level", expanded=False)
+
+        with fc_fund_exp:
+            nc1, nc2 = st.columns(2)
+            net_cash_m = nc1.number_input(
+                "Net Cash ($mm)", value=0.7, step=0.1, format="%.1f", key="funded_net_cash",
+                help="Surplus cash and other fund assets sitting outside the portfolio marks "
+                     "-- the gap between the fund's reported value and the sum of its company "
+                     "marks. Shown as a balance-sheet line, as in the source model.",
+            )
+            tax_blocker_m = nc2.number_input(
+                "Tax Blocker Leakage ($mm)", value=0.0, step=0.1, format="%.1f",
+                key="funded_tax_blocker",
+                help="Value lost through a blocker structure, spread across the exit years in "
+                     "proportion to each year's proceeds. Negative to the LP, so enter it as a "
+                     "positive number here and it is deducted.",
+            )
+            st.caption(
+                "These two lines are presentational: they appear in this block's arithmetic "
+                "but do not move the Secondary Pricing tab, which prices off NAV and the "
+                "forecast. Say the word and I'll wire them into NAV too."
+            )
+
+        def _funded_rows(scale):
+            """scale: _fund for the whole fund, _lp_mm for the selling LP's share."""
+            cost = sum(precomputed[a]["cost_m"] for a in asset_ids)
+            rv = sum(precomputed[a]["rv_m"] for a in asset_ids)
+            mv = sum(precomputed[a]["mv_m"] for a in asset_ids)
+            if scale is _lp_mm:
+                cost, rv, mv = cost * lp_pct, rv * lp_pct, mv * lp_pct
+                cash = net_cash_m * lp_pct
+                blocker = tax_blocker_m * lp_pct
+                accrued = accrued_carry_lp / 1_000_000
+            else:
+                cash = net_cash_m
+                blocker = tax_blocker_m
+                accrued = accrued_carry / 1_000_000
+
+            by_year = {f["year"]: f for f in fee_lines}
+
+            def row(label, per_year, c=0.0, r=0.0, m=0.0):
+                d = {"Line item": label, "Cost": c, "RV": r, "MV": m}
+                for i, y in enumerate(proj_years, start=1):
+                    d[str(y)] = per_year(by_year[i]) if i in by_year else 0.0
+                d["Proceeds"] = sum(d[str(y)] for y in proj_years)
+                return d
+
+            current = row("Current Investments", lambda f: scale(f["pre_fee_distribution"]),
+                          cost, rv, mv)
+            # Net cash is a balance-sheet item in the source model: it shows in the value
+            # columns, not as a cash flow in any year.
+            netcash = {"Line item": "Net Cash", "Cost": 0.0, "RV": cash, "MV": cash,
+                       **{str(y): 0.0 for y in proj_years}, "Proceeds": 0.0}
+            fees = row("Management fees", lambda f: -scale(f["fee_on_distribution"]))
+            after_fees = {"Line item": "Proceeds after management fees"}
+            for k in ["Cost", "RV", "MV"] + [str(y) for y in proj_years] + ["Proceeds"]:
+                after_fees[k] = current[k] + netcash[k] + fees[k]
+
+            future_carry = row("Future Carried Interest on Funded Commitment",
+                               lambda f: -scale(f["gp_carry"]))
+            accrued_row = row("Accrued Carried Interest to Date",
+                              lambda f: -accrued * (f["distribution"] / total_dist))
+            blocker_row = row("Tax Blocker Leakage",
+                              lambda f: -blocker * (f["distribution"] / total_dist))
+            after_carry = {"Line item": "Proceeds after carried Interest"}
+            for k in ["Cost", "RV", "MV"] + [str(y) for y in proj_years] + ["Proceeds"]:
+                after_carry[k] = (after_fees[k] + future_carry[k] + accrued_row[k] + blocker_row[k])
+
+            return [current, netcash, fees, after_fees, future_carry, accrued_row,
+                    blocker_row, after_carry]
+
+        def _show_block(rows, container, lp_view):
+            cols = (["Line item", "Cost", "RV", "MV"] + [str(y) for y in proj_years] + ["Proceeds"])
+            df = pd.DataFrame(rows, columns=cols)
+            if lp_view:
+                df = df.rename(columns={"Cost": "LP Cost", "RV": "LP RV", "MV": "LP MV",
+                                        "Proceeds": "LP Proceeds"})
+                # MOIC only where it means something: proceeds against the cost that earned them.
+                df["LP MOIC"] = [
+                    (r["LP Proceeds"] / r["LP Cost"]) if r["LP Cost"] else None
+                    for _, r in df.iterrows()
+                ]
+                money = ["LP Cost", "LP RV", "LP MV", "LP Proceeds"]
+            else:
+                money = ["Cost", "RV", "MV", "Proceeds"]
+            fmt = {c: "{:,.2f}" for c in money}
+            fmt.update({str(y): "{:,.2f}" for y in proj_years})
+            if lp_view:
+                fmt["LP MOIC"] = "{:.2f}x"
+            with container:
+                st.dataframe(df.style.format(fmt, na_rep=""), width="stretch", hide_index=True)
+
+        _show_block(_funded_rows(_fund), fc_fund_exp, lp_view=False)
+        _show_block(_funded_rows(_lp_mm), fc_lp_exp, lp_view=True)
+
+        with fc_fund_exp:
+            borne_by_nav = sum(f["fee_total"] - f["fee_on_distribution"] for f in fee_lines)
+            st.caption(
+                f"Memo: a further ${_fund(borne_by_nav):,.2f}mm of management fee is borne by "
+                "NAV still held rather than by a distribution, so it shows up as smaller "
+                "proceeds in later years rather than as a line here."
+            )
+
+        # ---------------- Unfunded Commitment ----------------
+        st.markdown("### Unfunded Commitment")
+        uc_fund_exp = st.expander("Fund level", expanded=True)
+        uc_lp_exp = st.expander("LP level", expanded=False)
+
+        # The blind pool on its own: the same schedule builder, with no follow-ons in it.
+        blind_calls = build_unfunded_schedule([], blind_pool_amount * lp_pct, blind_pool_years,
+                                              forecast_rows)
+        # build_unfunded_returns also reports what falls beyond the horizon; only the
+        # schedule itself is needed here.
+        blind_returns = (build_unfunded_returns(blind_calls, unfunded_hold_years, unfunded_moic,
+                                                forecast_rows)[0]
+                         if unfunded_generates_return else {})
+
+        post_cost = sum(float(r.get("Cost", 0.0)) for r in st.session_state["followon_rows"])
+        post_flows, post_proceeds = {}, 0.0
+        for fr in st.session_state["followon_rows"]:
+            f, p, _ = _post_flows(fr.get("Cost", 0.0), fr.get("Year", 1))
+            for y, v in f.items():
+                post_flows[y] = post_flows.get(y, 0.0) + v
+            post_proceeds += p
+
+        def _unfunded_rows(lp_view):
+            s = lp_pct if lp_view else 1.0
+
+            def row(label, per_year, c=0.0, r=0.0, m=0.0):
+                d = {"Line item": label, "Cost": c, "RV": r, "MV": m}
+                for y in proj_years:
+                    d[str(y)] = per_year(y)
+                d["Proceeds"] = sum(d[str(y)] for y in proj_years)
+                return d
+
+            post = row("Post-Report Date Investments",
+                       lambda y: post_flows.get(y, 0.0) * s,
+                       post_cost * s, post_cost * s, post_cost * s)
+            # Carry on the post-report investments' own profit, spread across the years the
+            # money actually comes back in.
+            profit = max(0.0, post_proceeds - post_cost)
+            carry_amt = profit * carry_rate if apply_fees else 0.0
+            post_carry = row(
+                "Carried Interest on Post-Report Investments",
+                lambda y: -carry_amt * s * ((max(0.0, post_flows.get(y, 0.0)) / post_proceeds)
+                                            if post_proceeds else 0.0),
+            )
+            # blind_calls / blind_returns are LP-level dollars keyed by forecast year number.
+            gross_up = 1.0 if lp_view else ((1 / lp_pct) if lp_pct else 0.0)
+            drawdown = row("Drawdown on remaining unfunded",
+                           lambda y: -blind_calls.get(y - as_of.year, 0.0) / 1_000_000 * gross_up)
+            ret = row("Return on Remaining Unfunded",
+                      lambda y: blind_returns.get(y - as_of.year, 0.0) / 1_000_000 * gross_up)
+            total = {"Line item": "Unfunded Commitment"}
+            for k in ["Cost", "RV", "MV"] + [str(y) for y in proj_years] + ["Proceeds"]:
+                total[k] = post[k] + post_carry[k] + drawdown[k] + ret[k]
+            return [post, post_carry, drawdown, ret, total]
+
+        _show_block(_unfunded_rows(False), uc_fund_exp, lp_view=False)
+        _show_block(_unfunded_rows(True), uc_lp_exp, lp_view=True)
+        with uc_fund_exp:
+            st.caption(
+                "Drawdown is the blind-pool commitment still to be called (the named "
+                "follow-ons are the row above it); its return lands after the assumed hold at "
+                "the assumed MOIC. Both are shown as they hit the fund, negative when called."
+            )
+
+        # ---------------- How fees and carry are calculated ----------------
+        st.markdown("### How fees and carried interest are calculated")
+        if not apply_fees:
+            st.info("Fees and carry are switched off in the sidebar, so there is nothing to show here.")
+        else:
+            SERIES_1 = "#2a78d6"   # blue   -- validated categorical slot 1
+            SERIES_2 = "#eb6834"   # orange -- validated categorical slot 2
+            GRID = "rgba(0,0,0,0.08)"
+
+            # ---- Management fee ----
+            st.markdown("**Management fee**")
+            if use_two_tier_fee:
+                st.write(
+                    f"Two rates on two different bases. Through forecast year "
+                    f"{crossover_year - 1} the fee is **{fee_rate_initial*100:.1f}% of committed "
+                    f"capital** — it does not matter how much is actually invested. From year "
+                    f"{crossover_year} the basis switches to **{fee_rate_post*100:.1f}% of the "
+                    f"cost still in the ground**, which shrinks as companies exit. That is why "
+                    f"the bars below step down rather than staying flat."
+                )
+                fee_basis_rows = [
+                    {"Year": as_of.year + int(r["Year"]),
+                     "Basis": ("Committed capital" if int(r["Year"]) < crossover_year
+                               else "Remaining cost"),
+                     "Fee basis": r["Fee basis ($)"] / lp_pct / 1_000_000 if lp_pct else 0.0,
+                     "Fee": r["Fee ($)"] / lp_pct / 1_000_000 if lp_pct else 0.0}
+                    for _, r in fee_schedule_display.iterrows()
+                ] if fee_schedule_display is not None else []
+            else:
+                st.write(
+                    f"A flat **{mgmt_fee*100:.1f}% a year on the portfolio's value**, charged "
+                    "before anything is distributed. The basis is the NAV itself, so the fee "
+                    "falls away naturally as the portfolio is realised — the bars below are "
+                    "that year's value being charged on."
+                )
+                fee_basis_rows = [
+                    {"Year": as_of.year + r["year"], "Basis": "Portfolio value (NAV)",
+                     "Fee basis": _fund(r.get("grown_nav", 0.0)),
+                     "Fee": _fund(r.get("mgmt_fee", 0.0))}
+                    for r in forecast_rows
+                ]
+
+            if fee_basis_rows:
+                fb = pd.DataFrame(fee_basis_rows)
+                fig_fee = go.Figure()
+                # One bar trace per basis, so the change of basis is a change of colour and
+                # carries a legend entry -- identity is never colour alone.
+                for i, basis in enumerate(fb["Basis"].unique()):
+                    part = fb[fb["Basis"] == basis]
+                    fig_fee.add_bar(
+                        x=part["Year"], y=part["Fee basis"], name=basis,
+                        marker_color=[SERIES_1, SERIES_2][i % 2],
+                        text=[f"fee {v:,.1f}" for v in part["Fee"]], textposition="outside",
+                        hovertemplate="%{x}<br>Basis %{y:,.1f}mm<br>%{text}mm<extra></extra>",
+                    )
+                fig_fee.update_layout(
+                    title="What the fee is charged on, and the fee it produces ($mm, fund level)",
+                    yaxis=dict(title="Fee basis ($mm)", gridcolor=GRID, zerolinecolor=GRID),
+                    xaxis=dict(title="", gridcolor=GRID),
+                    plot_bgcolor="rgba(0,0,0,0)", bargap=0.35, height=340,
+                    legend=dict(orientation="h", y=-0.18),
+                )
+                st.plotly_chart(fig_fee, width="stretch")
+                st.caption(
+                    "The bar is the basis; the number above it is the fee that basis produces. "
+                    "They are shown on one scale rather than two axes -- a fee is a thin slice "
+                    "of its basis, and plotting both on their own axes would make them look "
+                    "comparable when they are not."
+                )
+
+            # ---- Carried interest ----
+            st.markdown("**Carried interest**")
+            rf_style = "declining" if waterfall_style == "Declining hurdle balance" else "compounded"
+            rollf = carry_rollforward(forecast_rows, to_date.paid_in, to_date.distributions,
+                                       hurdle_rate, style=rf_style)
+            cleared = next((r for r in rollf if r["hurdle_cleared"]), None)
+            total_carry = sum(r["carry_in_year"] for r in rollf)
+            capital_base = max(0.0, to_date.paid_in - to_date.distributions)
+
+            if rf_style == "declining":
+                mechanic = (
+                    f"A running balance starts at the **${capital_base/1_000_000:,.2f}mm of the "
+                    f"LP's capital not yet returned**, grows by the {hurdle_rate*100:.1f}% "
+                    "preferred return each year, and shrinks as distributions are applied to it. "
+                    "The GP earns nothing while that balance is open."
+                )
+            else:
+                mechanic = (
+                    f"Every historical capital call is compounded forward at "
+                    f"{hurdle_rate*100:.1f}% to give a single target. The GP earns nothing until "
+                    "cumulative LP distributions cross it."
+                )
+            if cleared is not None:
+                when = (f"On this forecast that happens in **{as_of.year + cleared['year']}**, "
+                        f"after which the GP takes {carry_rate*100:.0f}% of everything above the "
+                        f"line — **${total_carry/1_000_000:,.2f}mm** in total (LP's share of the "
+                        "fund, since carry is charged on this LP's own cash flows).")
+            else:
+                when = ("On this forecast that never happens inside the horizon, so **no carry "
+                        "is taken at all** — every dollar projected goes to the LP.")
+            st.write(mechanic + " " + when)
+
+            rf_df = pd.DataFrame(rollf)
+            rf_df["Year"] = [as_of.year + r["year"] for r in rollf]
+            fig_c = go.Figure()
+            fig_c.add_scatter(
+                x=rf_df["Year"], y=rf_df["cumulative_distributions"] / 1_000_000,
+                name="Cumulative distributions", mode="lines+markers",
+                line=dict(color=SERIES_1, width=2), marker=dict(size=8),
+                hovertemplate="%{x}<br>Cumulative distributions %{y:,.2f}mm<extra></extra>",
+            )
+            hurdle_line = ((rf_df["cumulative_distributions"] + rf_df["hurdle_balance_closing"])
+                           / 1_000_000)
+            fig_c.add_scatter(
+                x=rf_df["Year"], y=hurdle_line,
+                name="Capital + preferred still to be covered", mode="lines+markers",
+                line=dict(color=SERIES_2, width=2, dash="dash"), marker=dict(size=8),
+                hovertemplate="%{x}<br>Hurdle line %{y:,.2f}mm<extra></extra>",
+            )
+            if cleared is not None:
+                cy = as_of.year + cleared["year"]
+                fig_c.add_vline(x=cy, line_width=1, line_dash="dot", line_color=SERIES_2)
+                fig_c.add_annotation(x=cy, yref="paper", y=1.0, text="hurdle cleared -> carry starts",
+                                      showarrow=False, yshift=8, font=dict(size=11))
+            fig_c.update_layout(
+                title="When the GP starts earning carry ($mm, LP's share)",
+                yaxis=dict(title="$mm", gridcolor=GRID, zerolinecolor=GRID),
+                xaxis=dict(title="", gridcolor=GRID),
+                plot_bgcolor="rgba(0,0,0,0)", height=340,
+                legend=dict(orientation="h", y=-0.18),
+            )
+            st.plotly_chart(fig_c, width="stretch")
+            st.caption(
+                "The two lines meet when the LP has been made whole on capital and preferred "
+                "return. Carry is zero to the left of that point no matter how large the "
+                "distributions are — that is what makes it a European, whole-of-fund waterfall."
+            )
+
+            with st.expander("Year-by-year workings"):
+                disp = pd.DataFrame([{
+                    "Year": as_of.year + r["year"],
+                    "Distribution": r["distribution"],
+                    "Hurdle balance, opening": r["hurdle_balance_opening"],
+                    "Preferred return accrued": r["preferred_accrued"],
+                    "Applied to capital + pref": r["applied_to_capital_and_pref"],
+                    "Hurdle balance, closing": r["hurdle_balance_closing"],
+                    "Cumulative distributions": r["cumulative_distributions"],
+                    "Cumulative preferred": r["cumulative_preferred"],
+                    "Carry entitlement, cumulative": r["carry_entitlement_cumulative"],
+                    "Carry in year": r["carry_in_year"],
+                } for r in rollf])
+                st.dataframe(
+                    disp.style.format({c: "${:,.0f}" for c in disp.columns if c != "Year"}),
+                    width="stretch", hide_index=True,
+                )
+                st.caption(
+                    "LP-level dollars, the basis the waterfall actually runs on. 'Carry in year' "
+                    "is read straight off the waterfall that produced the forecast, so this "
+                    "table can never disagree with the numbers above it."
+                )
+
 
 with tab4:
     st.subheader("Buyer vs. Seller")

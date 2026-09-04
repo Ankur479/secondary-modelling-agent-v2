@@ -664,6 +664,69 @@ def apply_carry_waterfall_declining_balance(paid_in_to_date: float, distribution
     return out
 
 
+def carry_rollforward(waterfall_rows: List[Dict], paid_in_to_date: float,
+                       distributions_to_date: float, hurdle_rate: float,
+                       style: str = "declining") -> List[Dict]:
+    """
+    The year-by-year workings behind whichever waterfall produced `waterfall_rows`,
+    laid out the way a fund model shows them so the mechanism can be read (and
+    checked) rather than taken on trust.
+
+    style="declining": Hurdle Balance opening, preferred return accrued on it, the
+      distribution applied against it, closing balance -- the amortizing-loan view.
+    style="compounded": the single compounded threshold each year against cumulative
+      LP distributions; "balance" here is the shortfall still to be covered, so the
+      same column reads as "how far from carry" under either mechanic.
+
+    Both styles also carry cumulative distributions, cumulative preferred return, the
+    cumulative carry entitlement and the carry actually taken that year. Carry taken
+    is read from the waterfall rows themselves rather than recomputed, so this table
+    can never tell a different story than the numbers it is explaining.
+    """
+    capital_base = max(0.0, paid_in_to_date - distributions_to_date)
+    balance = capital_base
+    cum_dist = 0.0
+    cum_pref = 0.0
+    cum_carry = 0.0
+    out = []
+    for row in waterfall_rows:
+        g = row.get("gross_distribution", 0.0)
+        gp = row.get("gp_carry", 0.0)
+        if style == "declining":
+            opening = balance
+            pref = opening * hurdle_rate
+            applied = min(opening + pref, g)
+            balance = opening + pref - applied
+            closing = balance
+        else:
+            # The compounded-threshold mechanic doesn't roll a balance forward; the
+            # comparable quantity is the shortfall between the threshold and what the
+            # LP has cumulatively received.
+            threshold = row.get("hurdle_threshold", 0.0)
+            opening = max(0.0, threshold - cum_dist)
+            pref = 0.0
+            applied = min(opening, g)
+            closing = max(0.0, threshold - (cum_dist + g))
+        cum_dist += g
+        cum_pref += pref
+        cum_carry += gp
+        out.append({
+            "year": row.get("year"),
+            "date": row.get("date"),
+            "distribution": g,
+            "hurdle_balance_opening": opening,
+            "preferred_accrued": pref,
+            "applied_to_capital_and_pref": applied,
+            "hurdle_balance_closing": closing,
+            "cumulative_distributions": cum_dist,
+            "cumulative_preferred": cum_pref,
+            "carry_entitlement_cumulative": cum_carry,
+            "carry_in_year": gp,
+            "hurdle_cleared": closing <= 1e-6,
+        })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Unfunded commitment (future capital calls the secondary buyer must fund)
 # ---------------------------------------------------------------------------
